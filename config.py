@@ -22,16 +22,24 @@ ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdig
 if OWNER_ID and OWNER_ID not in ADMIN_IDS:
     ADMIN_IDS.append(OWNER_ID)
 
-# ==================== БАЗЫ ДАННЫХ (SUPABASE) ====================
+# ==================== БАЗЫ ДАННЫХ (SUPABASE, сука) ====================
+def _ensure_asyncpg_driver(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
 # 1. Собственная база сервиса AvesWork (Read/Write)
-WORK_DB_URL = os.getenv("WORK_DB_URL", "")
+WORK_DB_URL = _ensure_asyncpg_driver(os.getenv("WORK_DB_URL", ""))
 
 # 2. База Биофака (Read-Only)
-BIO_DB_URL = os.getenv("BIO_DB_URL", "")
+BIO_DB_URL = _ensure_asyncpg_driver(os.getenv("BIO_DB_URL", ""))
 
 # 3. База ФСК (Read-Only)
-FSK_DB_URL = os.getenv("FSK_DB_URL", "")
-
+FSK_DB_URL = _ensure_asyncpg_driver(os.getenv("FSK_DB_URL", ""))
 # ==================== ВРЕМЯ И ТАЙМЗОНА ====================
 MINSK_TZ = ZoneInfo("Europe/Minsk")
 
