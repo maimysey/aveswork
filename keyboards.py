@@ -9,13 +9,23 @@ from models import UserBusySlot
 DAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
-# ==================== ГЛАВНОЕ МЕНЮ СТУДЕНТА ====================
+# ==================== КЛАВИАТУРЫ ГЛАВНОГО МЕНЮ ====================
 
 def student_main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="⏳ Мои занятые часы"), KeyboardButton(text="⚙️ Настройки")],
             [KeyboardButton(text="💼 Для работодателей"), KeyboardButton(text="ℹ️ О сервисе")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def employer_main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Инструкция к публикации"), KeyboardButton(text="📊 Мои смены")],
+            [KeyboardButton(text="ℹ️ О сервисе"), KeyboardButton(text="💬 Связь с поддержкой")],
         ],
         resize_keyboard=True,
     )
@@ -29,6 +39,15 @@ def student_busy_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="➕ Заблокировать время", callback_data="add_busy_slot")],
             [InlineKeyboardButton(text="📋 Мой список ограничений", callback_data="list_busy_slots")],
         ]
+    )
+
+
+def cancel_busy_input_kb() -> InlineKeyboardMarkup:
+    """Кнопка отмены при вводе личных часов в FSM"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отменить ввод", callback_data="cancel_busy_fsm")
+        ]]
     )
 
 
@@ -64,15 +83,39 @@ def student_settings_kb(is_active: bool, notifications_enabled: bool) -> InlineK
     )
 
 
-# ==================== РАБОТОДАТЕЛЬ: ПРЕВЬЮ СМЕНЫ ====================
+# ==================== РАБОТОДАТЕЛЬ: ПРЕВЬЮ СМЕН ====================
 
-def employer_preview_kb(vacancy_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Запустить рассылку кандидатам", callback_data=f"send_vac_{vacancy_id}")],
-            [InlineKeyboardButton(text="🗑 Отменить смену", callback_data=f"cancel_vac_{vacancy_id}")],
-        ]
-    )
+def employer_preview_kb(
+    vacancy_ids: list[int],
+    require_all_days: bool = False,
+    is_multi_day: bool = False,
+) -> InlineKeyboardMarkup:
+    ids_str = ",".join(map(str, vacancy_ids))
+    keyboard = []
+
+    # Если смена на 2+ дня — добавляем кнопку переключения режима
+    if is_multi_day:
+        if require_all_days:
+            mode_text = "🎯 Режим: Нужен на ВСЕ дни сразу"
+            next_val = 0
+        else:
+            mode_text = "🔀 Режим: Можно по отдельным дням"
+            next_val = 1
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=mode_text,
+                callback_data=f"toggle_mode_{ids_str}_{next_val}"
+            )
+        ])
+
+    mode_int = 1 if require_all_days else 0
+    keyboard.extend([
+        [InlineKeyboardButton(text="🚀 Запустить рассылку кандидатам", callback_data=f"send_vac_{ids_str}_{mode_int}")],
+        [InlineKeyboardButton(text="🗑 Отменить публикацию", callback_data=f"cancel_vac_{ids_str}")],
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 # ==================== КАРТОЧКА СМЕНЫ ДЛЯ СТУДЕНТА ====================
@@ -93,7 +136,7 @@ def student_applied_kb() -> InlineKeyboardMarkup:
     )
 
 
-# ==================== СВЯЗЬ С ВЛАДЕЛЬЦЕМ ДЛЯ БИЗНЕСА ====================
+# ==================== СВЯЗЬ С ВЛАДЕЛЬЦЕМ ====================
 
 def business_contact_kb(owner_username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
