@@ -2,6 +2,7 @@ import asyncio
 import html
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
+from aiogram.filters import BaseFilter
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
 from sqlalchemy import select
 
@@ -20,20 +21,23 @@ DAYS_NAMES = [
 ]
 
 
+# ==================== ФИЛЬТР: ТОЛЬКО АВТОРИЗОВАННЫЙ РАБОТОДАТЕЛЬ ====================
+
+class IsEmployerFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.from_user:
+            return False
+        async with work_session_maker() as session:
+            emp = await session.get(Employer, message.from_user.id)
+            return bool(emp and emp.is_active)
+
+
 # ==================== ПРИЕМ И ПАРСИНГ ТЕКСТА СМЕНЫ ====================
 
-@router.message(F.text)
+@router.message(F.text, ~F.text.startswith("/"), IsEmployerFilter())
 async def handle_employer_vacancy_post(message: Message):
-    # Команды пропускаем в соответствующие роутеры
-    if message.text.startswith("/"):
-        return
-
-    # Проверяем, является ли пользователь авторизованным менеджером
     async with work_session_maker() as session:
         employer = await session.get(Employer, message.from_user.id)
-
-    if not employer or not employer.is_active:
-        return  # Не работодатель — передаем управление дальше (роутеру студента)
 
     parsed = parse_vacancy_card(message.text)
     if not parsed:
@@ -104,7 +108,7 @@ async def cb_cancel_vacancy(callback: CallbackQuery):
             await session.delete(vac)
             await session.commit()
 
-    await callback.message.edit_text("❌ <b>Публикация смены отменена</b> Вы можете прислать новый текст")
+    await callback.message.edit_text("❌ <b>Публикация смены отменена.</b> Вы можете прислать новый текст")
     await callback.answer()
 
 
@@ -117,7 +121,7 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
     async with work_session_maker() as session:
         vac = await session.get(Vacancy, vac_id)
         if not vac:
-            await callback.answer("Смена не найдена или уже удалена", show_alert=True)
+            await callback.answer("Смена не найдена или уже удалена.", show_alert=True)
             return
 
         emp = await session.get(Employer, vac.employer_id)
@@ -125,7 +129,6 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
 
     await callback.message.edit_text("⏳ <b>Идет подбор кандидатов и рассылка пушей...</b>")
 
-    # Получаем финальный список свободных студентов
     total_potential, ready_candidate_ids = await find_available_candidates(
         target_date=vac.target_date,
         day_of_week=vac.day_of_week,
@@ -160,7 +163,7 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
                 session.add(VacancyDelivery(vacancy_id=vac.id, user_id=uid, status="sent"))
                 sent_count += 1
             except TelegramForbiddenError:
-                pass  # Пользователь заблокировал бота
+                pass
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after)
                 try:
@@ -176,13 +179,12 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
             except Exception:
                 pass
 
-            await asyncio.sleep(0.04)  # Лимит Telegram ~25 msg/sec
+            await asyncio.sleep(0.04)
 
         await session.commit()
 
     metrics_service.track_deliveries_sent(sent_count)
 
-    # Итоговый отчет менеджеру
     await callback.message.edit_text(
         f"✅ <b>Рассылка успешно выполнена!</b>\n\n"
         f"📬 Доставлено активным кандидатам: <b>{sent_count} чел.</b>\n"

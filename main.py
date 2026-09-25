@@ -20,7 +20,7 @@ WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
 
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.Response(text="AvesWork is running! 💼🚀", status=200)
+    return web.Response(text="AvesWork💼🚀", status=200)
 
 
 async def on_startup(bot: Bot):
@@ -68,12 +68,12 @@ def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Регистрация роутеров в порядке приоритета
+    # Регистрация роутеров в порядке приоритета ААААААА
+    dp.include_router(start.router)
     dp.include_router(admin.router)
     dp.include_router(employer.router)
     dp.include_router(student.router)
     dp.include_router(settings.router)
-    dp.include_router(start.router)
 
     # Инициализация веб-приложения aiohttp
     app = web.Application()
