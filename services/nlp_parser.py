@@ -13,8 +13,9 @@ DAY_ALIASES = {
     "вс": 6, "вск": 6, "воскресенье": 6, "воскресенья": 6, "воскресенью": 6,
 }
 
+# Строгая регулярка денег: четко отделяет число от времени и знаков препинания
 MONEY_REGEX = re.compile(
-    r"(?P<amount>\d+[\d\s.,]*)\s*(?P<currency>руб(?:л[ейяь]+)?|byn|bun|р\b|бел(?:\.|\s*)?руб)(?:\s*(?:/|за)?\s*(?P<unit>смен[ауеы]|час[а]?))?",
+    r"\b(?P<amount>\d+(?:\s\d{3})*(?:[.,]\d{1,2})?)\s*(?P<currency>руб(?:л[ейяь]+)?|byn|bun|р\b|бел(?:\.|\s*)?руб)\.?(?:\s*(?:/|за)?\s*(?P<unit>смен[ауеы]|час[а]?))?",
     re.IGNORECASE,
 )
 
@@ -65,7 +66,6 @@ def _make_calendar_date(d: int, m: int, y: int | None, today_date: date) -> date
         target_year = y if y else today_date.year
         if target_year < 100:
             target_year += 2000
-        # Если указан прошлый месяц без года (например, в декабре пишут 10.01) — переносим на след. год
         parsed_d = date(target_year, m, d)
         if not y and parsed_d < today_date - timedelta(days=60):
             parsed_d = date(target_year + 1, m, d)
@@ -87,9 +87,11 @@ def parse_vacancy_card(text: str) -> dict[str, Any] | None:
     if money_match:
         raw_val = money_match.group("amount").replace(" ", "").replace(",", ".")
         try:
-            pay_amount = int(float(raw_val))
-            unit = money_match.group("unit")
-            pay_unit = f"BYN/{unit}" if unit else "BYN"
+            parsed_val = int(float(raw_val))
+            if parsed_val > 0:
+                pay_amount = parsed_val
+                unit = money_match.group("unit")
+                pay_unit = f"BYN/{unit}" if unit else "BYN"
         except ValueError:
             pay_amount = None
 
@@ -99,10 +101,9 @@ def parse_vacancy_card(text: str) -> dict[str, Any] | None:
             + working_text[money_match.end() :]
         )
 
-    # ==================== ЭТАП 2: ТОЧНЫЕ ДАТЫ (29.09 И ДИАПАЗОНЫ) ====================
+    # ==================== ЭТАП 2: ТОЧНЫЕ ДАТЫ ====================
     target_dates_map: dict[date, int] = {}
 
-    # 2.1. Диапазоны дат: «с 28.09 по 30.09»
     for r_match in EXACT_DATE_RANGE_REGEX.finditer(working_text):
         d1, m1, y1 = int(r_match.group(1)), int(r_match.group(2)), int(r_match.group(3)) if r_match.group(3) else None
         d2, m2, y2 = int(r_match.group(4)), int(r_match.group(5)), int(r_match.group(6)) if r_match.group(6) else None
@@ -118,7 +119,6 @@ def parse_vacancy_card(text: str) -> dict[str, Any] | None:
 
     working_text = EXACT_DATE_RANGE_REGEX.sub(" [DATE_RANGE] ", working_text)
 
-    # 2.2. Одиночные даты: «29.09», «29.09.2026»
     for d_match in SINGLE_DATE_REGEX.finditer(working_text):
         d, m, y = int(d_match.group(1)), int(d_match.group(2)), int(d_match.group(3)) if d_match.group(3) else None
         cal_dt = _make_calendar_date(d, m, y, today_date)
@@ -153,7 +153,6 @@ def parse_vacancy_card(text: str) -> dict[str, Any] | None:
         if "сегодня" in working_text:
             target_dates_map[today_date] = today_date.weekday()
 
-        # Диапазоны дней недели: «пн-ср», «с пн по пт»
         w_range_match = WEEKDAY_RANGE_REGEX.search(working_text)
         if w_range_match:
             w1, w2 = w_range_match.group(1), w_range_match.group(2)
@@ -164,14 +163,12 @@ def parse_vacancy_card(text: str) -> dict[str, Any] | None:
                         calc_d = _calculate_upcoming_date(d_idx, start_time.hour, now_dt)
                         target_dates_map[calc_d] = d_idx
 
-        # Одиночные дни недели
         for w in re.findall(r"\b[а-яё]{2,12}\b", working_text):
             if w in DAY_ALIASES:
                 d_idx = DAY_ALIASES[w]
                 calc_d = _calculate_upcoming_date(d_idx, start_time.hour, now_dt)
                 target_dates_map[calc_d] = d_idx
 
-    # Фоллбэк: если день вообще не указан — ставим сегодня или завтра
     if not target_dates_map:
         fallback_d = today_date if now_dt.hour < start_time.hour else today_date + timedelta(days=1)
         target_dates_map[fallback_d] = fallback_d.weekday()
@@ -208,14 +205,12 @@ def parse_user_busy_input(text: str) -> dict[str, Any] | None:
     clean_text = working_text[: time_match.start()] + " " + working_text[time_match.end() :]
     target_days: set[int] = set()
 
-    # Точные даты: «29.09 с 14 до 18»
     for d_match in SINGLE_DATE_REGEX.finditer(clean_text):
         d, m, y = int(d_match.group(1)), int(d_match.group(2)), int(d_match.group(3)) if d_match.group(3) else None
         cal_dt = _make_calendar_date(d, m, y, today_date)
         if cal_dt:
             target_days.add(cal_dt.weekday())
 
-    # Диапазоны дней недели
     w_range = WEEKDAY_RANGE_REGEX.search(clean_text)
     if w_range:
         w1, w2 = w_range.group(1), w_range.group(2)

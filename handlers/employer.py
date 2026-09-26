@@ -26,6 +26,13 @@ DAYS_NAMES = [
     "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"
 ]
 
+EMPLOYER_MENU_BUTTONS = {
+    "📝 Инструкция к публикации",
+    "📊 Мои смены",
+    "ℹ️ О сервисе",
+    "💬 Связь с поддержкой",
+}
+
 
 # ==================== ФИЛЬТР: ТОЛЬКО АВТОРИЗОВАННЫЙ РАБОТОДАТЕЛЬ ====================
 
@@ -52,6 +59,12 @@ async def cmd_instruction(message: Message):
         "Бот автоматически распознает даты, проверит расписание студентов БГУ и покажет аудиторию перед отправкой"
     )
     await message.answer(text)
+
+
+@router.message(F.text == "ℹ️ О сервисе", IsEmployerFilter())
+async def cmd_employer_help(message: Message):
+    from handlers.settings import HELP_TEXT
+    await message.answer(HELP_TEXT, reply_markup=business_contact_kb(OWNER_USERNAME))
 
 
 @router.message(F.text == "💬 Связь с поддержкой", IsEmployerFilter())
@@ -118,7 +131,7 @@ async def cb_manage_vacancy(callback: CallbackQuery):
     async with work_session_maker() as session:
         vac = await session.get(Vacancy, vac_id)
         if not vac or vac.employer_id != callback.from_user.id:
-            await callback.answer("Смена не найдена или уже удалена.", show_alert=True)
+            await callback.answer("Смена не найдена или уже удалена", show_alert=True)
             return
 
         total_sent = await session.scalar(
@@ -126,7 +139,6 @@ async def cb_manage_vacancy(callback: CallbackQuery):
             .where(VacancyDelivery.vacancy_id == vac.id)
         ) or 0
 
-        # Получаем соискателей, нажавших «Откликнуться»
         applied_deliveries = (await session.execute(
             select(VacancyDelivery.user_id)
             .where(VacancyDelivery.vacancy_id == vac.id)
@@ -153,7 +165,7 @@ async def cb_manage_vacancy(callback: CallbackQuery):
         for idx, uid in enumerate(applied_deliveries, 1):
             lines.append(f"{idx}. <a href='tg://user?id={uid}'>Кандидат #{uid}</a> (ID: <code>{uid}</code>)")
     else:
-        lines.append("<i>Откликов пока нет. Ожидайте уведомлений в чате.</i>")
+        lines.append("<i>Откликов пока нет. Ожидайте уведомлений в чате</i>")
 
     await callback.message.edit_text(
         "\n".join(lines),
@@ -236,7 +248,8 @@ def _build_preview_text(
 
 # ==================== ПРИЕМ И ПАРСИНГ ТЕКСТА СМЕНЫ ====================
 
-@router.message(F.text, ~F.text.startswith("/"), IsEmployerFilter())
+# Фильтр исключает кнопки нижнего меню работодателя
+@router.message(F.text, ~F.text.startswith("/"), ~F.text.in_(EMPLOYER_MENU_BUTTONS), IsEmployerFilter())
 async def handle_employer_vacancy_post(message: Message):
     async with work_session_maker() as session:
         employer = await session.get(Employer, message.from_user.id)
@@ -244,7 +257,7 @@ async def handle_employer_vacancy_post(message: Message):
     parsed = parse_vacancy_card(message.text)
     if not parsed or not parsed["shifts"]:
         await message.reply(
-            "⚠️ <b>Не удалось определить временной интервал смены!</b>\n\n"
+            "⚠️ <b>Не удалось определить временной интервал!</b>\n\n"
             "Пожалуйста, укажите часы работы, например:\n"
             "• <code>29.09 с 17:00 до 21:00</code>\n"
             "• <code>с 28.09 по 30.09 с 12:00 до 16:30</code>\n"
