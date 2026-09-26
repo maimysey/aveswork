@@ -4,7 +4,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from models import UserBusySlot
+from models import UserBusySlot, Vacancy
 
 DAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
@@ -24,14 +24,14 @@ def student_main_menu_kb() -> ReplyKeyboardMarkup:
 def employer_main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📝 Инструкция к публикации"), KeyboardButton(text="📊 Мои смены")],
+            [KeyboardButton(text="📝 Инструкция к публикации"), KeyboardButton(text="📊 Мои публикации")],
             [KeyboardButton(text="ℹ️ О сервисе"), KeyboardButton(text="💬 Связь с поддержкой")],
         ],
         resize_keyboard=True,
     )
 
 
-# ==================== УПРАВЛЕНИЕ ЗАНЯТЫМИ ЧАСАМИ ====================
+# ==================== УПРАВЛЕНИЕ ЗАНЯТЫМИ ЧАСАМИ СТУДЕНТА ====================
 
 def student_busy_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -43,7 +43,6 @@ def student_busy_menu_kb() -> InlineKeyboardMarkup:
 
 
 def cancel_busy_input_kb() -> InlineKeyboardMarkup:
-    """Кнопка отмены при вводе личных часов в FSM"""
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text="❌ Отменить ввод", callback_data="cancel_busy_fsm")
@@ -83,7 +82,7 @@ def student_settings_kb(is_active: bool, notifications_enabled: bool) -> InlineK
     )
 
 
-# ==================== РАБОТОДАТЕЛЬ: ПРЕВЬЮ СМЕН ====================
+# ==================== РАБОТОДАТЕЛЬ: ПРЕВЬЮ ПРИ СОЗДАНИИ ====================
 
 def employer_preview_kb(
     vacancy_ids: list[int],
@@ -93,7 +92,6 @@ def employer_preview_kb(
     ids_str = ",".join(map(str, vacancy_ids))
     keyboard = []
 
-    # Если смена на 2+ дня — добавляем кнопку переключения режима
     if is_multi_day:
         if require_all_days:
             mode_text = "🎯 Режим: Нужен на ВСЕ дни сразу"
@@ -116,6 +114,32 @@ def employer_preview_kb(
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+# ==================== РАБОТОДАТЕЛЬ: УПРАВЛЕНИЕ И УДАЛЕНИЕ СМЕН ====================
+
+def employer_vacancies_list_kb(vacancies_data: list[tuple[Vacancy, int]]) -> InlineKeyboardMarkup:
+    buttons = []
+    for vac, app_count in vacancies_data:
+        day_str = DAYS_SHORT[vac.day_of_week]
+        date_str = vac.target_date.strftime("%d.%m")
+        start_str = vac.start_time.strftime("%H:%M")
+        end_str = vac.end_time.strftime("%H:%M")
+        label = f"📅 {day_str} {date_str} ({start_str}–{end_str}) • 🙋‍♂️ {app_count}"
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"manage_vac_{vac.id}")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def employer_vacancy_manage_kb(vacancy_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Снять с публикации", callback_data=f"delete_vac_{vacancy_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад к списку смен", callback_data="back_to_my_vacs")],
+        ]
+    )
 
 
 # ==================== КАРТОЧКА СМЕНЫ ДЛЯ СТУДЕНТА ====================

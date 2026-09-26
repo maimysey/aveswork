@@ -3,7 +3,7 @@ import html
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import BaseFilter
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from sqlalchemy import select, func
 
 from config import logger, OWNER_USERNAME
@@ -16,6 +16,8 @@ from keyboards import (
     employer_preview_kb,
     student_vacancy_card_kb,
     business_contact_kb,
+    employer_vacancies_list_kb,
+    employer_vacancy_manage_kb,
 )
 
 router = Router()
@@ -42,47 +44,14 @@ class IsEmployerFilter(BaseFilter):
 async def cmd_instruction(message: Message):
     text = (
         "📝 <b>Как публиковать смены в AvesWork</b>\n\n"
-        "Просто отправьте в этот чат сообщение в свободной форме с описанием работы, часами и днями.\n\n"
+        "Отправьте в этот чат сообщение в свободной форме с описанием работы, часами и днями\n\n"
         "<b>Примеры:</b>\n"
-        "• <i>«Ищем бариста на смену в четверг с 16:00 до 21:00. Оплата 45 руб. Кофейня на Немиге»</i>\n"
-        "• <i>«Курьер в четверг и пятницу с 17 до 21. 50 BYN за смену. Выплаты сразу»</i>\n"
-        "• <i>«Помощник на склад с пн по ср 12:00 - 18:00, ставка 8 руб/час.»</i>\n\n"
-        "Бот автоматически распознает даты, проверит расписание студентов БГУ и покажет вам аудиторию перед отправкой"
+        "• <i>«Ищем бариста 29.09 с 16:00 до 21:00. Оплата 45 руб. Кофейня на Немиге»</i>\n"
+        "• <i>«Курьер в четверг и пятницу с 17 до 21. 50 BYN за смену»</i>\n"
+        "• <i>«Помощник на склад с 28.09 по 30.09 с 12 до 18, 10 руб/час.»</i>\n\n"
+        "Бот автоматически распознает даты, проверит расписание студентов БГУ и покажет аудиторию перед отправкой"
     )
     await message.answer(text)
-
-
-@router.message(F.text == "📊 Мои смены", IsEmployerFilter())
-async def cmd_my_vacancies(message: Message):
-    async with work_session_maker() as session:
-        vacancies = (await session.execute(
-            select(Vacancy)
-            .where(Vacancy.employer_id == message.from_user.id)
-            .order_by(Vacancy.created_at.desc())
-            .limit(10)
-        )).scalars().all()
-
-        if not vacancies:
-            await message.answer("У вас пока нет опубликованных смен. Отправьте текст смены в чат для создания!")
-            return
-
-        text_lines = ["📊 <b>Ваши последние смены:</b>\n"]
-        for vac in vacancies:
-            day_title = DAYS_NAMES[vac.day_of_week]
-            date_str = vac.target_date.strftime("%d.%m")
-            time_str = f"{vac.start_time.strftime('%H:%M')}–{vac.end_time.strftime('%H:%M')}"
-
-            app_count = await session.scalar(
-                select(func.count(VacancyDelivery.id))
-                .where(VacancyDelivery.vacancy_id == vac.id)
-                .where(VacancyDelivery.status == "applied")
-            ) or 0
-
-            text_lines.append(
-                f"• <b>{day_title} ({date_str}) {time_str}</b> | 🙋‍♂️ Откликов: <b>{app_count}</b>"
-            )
-
-    await message.answer("\n".join(text_lines))
 
 
 @router.message(F.text == "💬 Связь с поддержкой", IsEmployerFilter())
@@ -90,8 +59,126 @@ async def cmd_support(message: Message):
     await message.answer(
         "💬 <b>Поддержка и вопросы сотрудничества:</b>\n"
         f"Напишите владельцу платформы: @{OWNER_USERNAME}",
-        reply_markup=business_contact_kb(OWNER_USERNAME)
+        reply_markup=business_contact_kb(OWNER_USERNAME),
     )
+
+
+# ==================== УПРАВЛЕНИЕ И УДАЛЕНИЕ СМЕН (МОИ СМЕНЫ) ====================
+
+async def _render_vacancies_list(user_id: int) -> tuple[str, any]:
+    async with work_session_maker() as session:
+        vacancies = (await session.execute(
+            select(Vacancy)
+            .where(Vacancy.employer_id == user_id)
+            .order_by(Vacancy.target_date.desc(), Vacancy.start_time.asc())
+        )).scalars().all()
+
+        if not vacancies:
+            return "📋 <b>У вас пока нет активных смен.</b>\nОтправьте текст смены в чат, чтобы создать новую!", None
+
+        # Считаем отклики для каждой смены
+        app_counts = (await session.execute(
+            select(VacancyDelivery.vacancy_id, func.count(VacancyDelivery.id))
+            .where(VacancyDelivery.vacancy_id.in_([v.id for v in vacancies]))
+            .where(VacancyDelivery.status == "applied")
+            .group_by(VacancyDelivery.vacancy_id)
+        )).all()
+        app_dict = dict(app_counts)
+
+        vacancies_data = [(v, app_dict.get(v.id, 0)) for v in vacancies]
+
+    text = (
+        "📊 <b>Ваши смены в системе:</b>\n"
+        "<i>Нажмите на смену ниже, чтобы посмотреть отклики или снять её с публикации:</i>"
+    )
+    kb = employer_vacancies_list_kb(vacancies_data)
+    return text, kb
+
+
+@router.message(F.text == "📊 Мои смены", IsEmployerFilter())
+async def cmd_my_vacancies(message: Message):
+    text, kb = await _render_vacancies_list(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "back_to_my_vacs")
+async def cb_back_to_my_vacs(callback: CallbackQuery):
+    text, kb = await _render_vacancies_list(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("manage_vac_"))
+async def cb_manage_vacancy(callback: CallbackQuery):
+    vac_id = int(callback.data.split("_")[2])
+
+    async with work_session_maker() as session:
+        vac = await session.get(Vacancy, vac_id)
+        if not vac or vac.employer_id != callback.from_user.id:
+            await callback.answer("Смена не найдена или уже удалена.", show_alert=True)
+            return
+
+        total_sent = await session.scalar(
+            select(func.count(VacancyDelivery.id))
+            .where(VacancyDelivery.vacancy_id == vac.id)
+        ) or 0
+
+        # Получаем соискателей, нажавших «Откликнуться»
+        applied_deliveries = (await session.execute(
+            select(VacancyDelivery.user_id)
+            .where(VacancyDelivery.vacancy_id == vac.id)
+            .where(VacancyDelivery.status == "applied")
+        )).scalars().all()
+
+    day_title = DAYS_NAMES[vac.day_of_week]
+    date_str = vac.target_date.strftime("%d.%m.%Y")
+    time_str = f"{vac.start_time.strftime('%H:%M')} — {vac.end_time.strftime('%H:%M')}"
+    pay_str = f"{vac.pay_amount} {vac.pay_unit}" if vac.pay_amount else "По договоренности"
+
+    lines = [
+        f"📋 <b>Управление сменой #{vac.id}</b>\n",
+        f"🗓 <b>Дата:</b> {day_title} ({date_str})",
+        f"⏰ <b>Время:</b> {time_str}",
+        f"💰 <b>Оплата:</b> {pay_str}",
+        f"📬 <b>Доставлено пушей студентам:</b> {total_sent} чел.",
+        f"🙋‍♂️ <b>Откликов:</b> {len(applied_deliveries)} чел.\n",
+        f"📝 <b>Текст вакансии:</b>\n<i>{html.escape(vac.raw_text)}</i>\n",
+    ]
+
+    if applied_deliveries:
+        lines.append("👥 <b>Откликнувшиеся соискатели:</b>")
+        for idx, uid in enumerate(applied_deliveries, 1):
+            lines.append(f"{idx}. <a href='tg://user?id={uid}'>Кандидат #{uid}</a> (ID: <code>{uid}</code>)")
+    else:
+        lines.append("<i>Откликов пока нет. Ожидайте уведомлений в чате.</i>")
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=employer_vacancy_manage_kb(vac.id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delete_vac_"))
+async def cb_delete_vacancy(callback: CallbackQuery):
+    vac_id = int(callback.data.split("_")[2])
+
+    async with work_session_maker() as session:
+        vac = await session.get(Vacancy, vac_id)
+        if vac and vac.employer_id == callback.from_user.id:
+            await session.delete(vac)
+            await session.commit()
+
+    await callback.answer("Смена успешно снята с публикации!", show_alert=True)
+
+    text, kb = await _render_vacancies_list(callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЙ ФОРМАТТЕР ПРЕВЬЮ ====================
@@ -159,9 +246,9 @@ async def handle_employer_vacancy_post(message: Message):
         await message.reply(
             "⚠️ <b>Не удалось определить временной интервал смены!</b>\n\n"
             "Пожалуйста, укажите часы работы, например:\n"
-            "• <code>с 17:00 до 21:00 в чт и пт</code>\n"
-            "• <code>завтра 12:00 - 16:30</code>\n"
-            "• <code>с 18 до 22 в субботу</code>"
+            "• <code>29.09 с 17:00 до 21:00</code>\n"
+            "• <code>с 28.09 по 30.09 с 12:00 до 16:30</code>\n"
+            "• <code>в чт и пт с 18 до 22</code>"
         )
         return
 
@@ -187,7 +274,6 @@ async def handle_employer_vacancy_post(message: Message):
 
     metrics_service.track_vacancy_created()
 
-    # Предварительный расчет аудитории (по умолчанию гибкий отбор)
     shifts_data = [{"target_date": v.target_date, "day_of_week": v.day_of_week} for v in created_vacancies]
     total_potential, ready_candidates, breakdown = await find_available_candidates_batch(
         shifts=shifts_data,
@@ -255,14 +341,18 @@ async def cb_toggle_mode(callback: CallbackQuery):
         require_all_days=new_require_all,
     )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=employer_preview_kb(vac_ids, require_all_days=new_require_all, is_multi_day=True)
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=employer_preview_kb(vac_ids, require_all_days=new_require_all, is_multi_day=True)
+        )
+    except TelegramBadRequest:
+        pass
+
     await callback.answer()
 
 
-# ==================== ОТМЕНА СМЕНЫ ====================
+# ==================== ОТМЕНА ЧЕРНОВИКА СМЕНЫ ====================
 
 @router.callback_query(F.data.startswith("cancel_vac_"))
 async def cb_cancel_vacancy(callback: CallbackQuery):
@@ -280,7 +370,7 @@ async def cb_cancel_vacancy(callback: CallbackQuery):
 
         await session.commit()
 
-    await callback.message.edit_text("❌ <b>Публикация смен отменена</b> Вы можете прислать новый текст")
+    await callback.message.edit_text("❌ <b>Публикация смен отменена.</b> Вы можете прислать новый текст")
     await callback.answer()
 
 
@@ -300,7 +390,7 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
         )).scalars().all()
 
         if not vacancies:
-            await callback.answer("Смены не найдены.", show_alert=True)
+            await callback.answer("Смены не найдены", show_alert=True)
             return
 
         emp = await session.get(Employer, vacancies[0].employer_id)
@@ -318,7 +408,6 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
         require_all_days=require_all_days,
     )
 
-    # Формируем карточку для студента
     time_str = f"{first_v.start_time.strftime('%H:%M')} – {first_v.end_time.strftime('%H:%M')}"
     pay_line = f"💰 Оплата: <b>{first_v.pay_amount} {first_v.pay_unit}</b>\n" if first_v.pay_amount else ""
 
