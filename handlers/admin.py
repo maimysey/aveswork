@@ -1,18 +1,29 @@
 import asyncio
 import os
 import html
+import uuid
+from datetime import datetime, time, timedelta
 from aiogram import Router, Bot
 from aiogram.filters import Command, CommandObject, BaseFilter
 from aiogram.types import Message, FSInputFile
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from config import ADMIN_IDS, logger
+from config import (
+    ADMIN_IDS, WORK_MODE, WORK_RELAY_BOTS, WORK_TESTERS, WORK_WEB_ACCESS,
+    RELAY_MAX_PER_DAY, RELAY_MAX_PER_WEEK, QUIET_FROM, QUIET_TO, get_minsk_now, logger,
+)
 from database import work_session_maker
-from models import Employer, WorkUser, Vacancy, VacancyDelivery, UserBusySlot
+from models import Employer, WorkUser, Vacancy, VacancyDelivery, UserBusySlot, RelayOutbox
+from services.availability import find_student, forget_student
 from services.metrics import metrics_service
+from services.relay import queue_stats
+from services.shift_meta import describe
 
 router = Router()
+
+DEMO_EMPLOYER_ID = 0
 
 
 class IsAdminFilter(BaseFilter):
@@ -39,7 +50,12 @@ async def cmd_admin_help(message: Message):
         "<b>Аналитика и система:</b>\n"
         "• <code>/stats</code> — полная статистика платформы и DAU\n"
         "• <code>/tech Текст</code> — рассылка оповещения всем соискателям\n"
-        "• <code>/logs</code> — скачать лог-файл (work_bot.log)"
+        "• <code>/logs</code> — скачать лог-файл (work_bot.log)\n\n"
+        "<b>Тест раздела «Смены»:</b>\n"
+        "• <code>/work</code> — режим, тестеры, очередь коротких уведомлений\n"
+        "• <code>/demo</code> — 3 демо-смены (видят только тестеры)\n"
+        "• <code>/demo_clear</code> — удалить демо-смены\n"
+        "• <code>/relay_test</code> — прислать себе короткое уведомление через бота факультета"
     )
     await message.answer(text)
 
@@ -123,7 +139,9 @@ async def cmd_delete_business(message: Message, command: CommandObject):
 async def cmd_list_employers(message: Message):
     async with work_session_maker() as session:
         employers = (await session.execute(
-            select(Employer).order_by(Employer.created_at.desc())
+            select(Employer)
+            .where(Employer.telegram_id != DEMO_EMPLOYER_ID)
+            .order_by(Employer.created_at.desc())
         )).scalars().all()
 
     if not employers:
@@ -158,12 +176,17 @@ async def cmd_admin_stats(message: Message):
         notif_users = await session.scalar(
             select(func.count(WorkUser.telegram_id)).where(WorkUser.notifications_enabled == True)
         ) or 0
+        web_only = await session.scalar(
+            select(func.count(WorkUser.telegram_id)).where(WorkUser.bot_started == False)
+        ) or 0
         total_busy_slots = await session.scalar(select(func.count(UserBusySlot.id))) or 0
 
         total_employers = await session.scalar(
             select(func.count(Employer.telegram_id)).where(Employer.is_active == True)
         ) or 0
-        total_vacancies = await session.scalar(select(func.count(Vacancy.id))) or 0
+        total_vacancies = await session.scalar(
+            select(func.count(Vacancy.id)).where(Vacancy.status != "draft").where(Vacancy.is_demo == False)
+        ) or 0
         total_deliveries = await session.scalar(select(func.count(VacancyDelivery.id))) or 0
         total_applications = await session.scalar(
             select(func.count(VacancyDelivery.id)).where(VacancyDelivery.status == "applied")
@@ -176,27 +199,140 @@ async def cmd_admin_stats(message: Message):
 
     text = (
         f"📊 <b>Аналитика платформы AvesWork</b>\n"
-        f"<i>Сервер активен с: {m['boot_time']}</i>\n\n"
+        f"<i>Сервер активен с: {m['boot_time']}</i>\n"
+        f"<i>Режим раздела «Смены»: {WORK_MODE}</i>\n\n"
         f"📈 <b>Активность за сегодня ({m['today_date']}):</b>\n"
         f"• 👥 DAU (активных соискателей): <b>{m['dau']}</b>\n"
         f"• ⚡ Запросов за сутки: <b>{m['daily_requests']}</b>\n"
         f"• 🕒 Пиковый час: <b>{m['peak_hour']}</b>\n"
         f"• 💼 Новых смен создано: <b>{m['daily_vacancies']}</b>\n"
-        f"• 📬 Пушей отправлено: <b>{m['daily_deliveries']}</b>\n"
+        f"• 📬 Уведомлений отправлено: <b>{m['daily_deliveries']}</b>\n"
         f"• 🙋‍♂️ Откликов на смены: <b>{m['daily_applications']}</b>\n\n"
         f"👤 <b>База соискателей:</b>\n"
-        f"• Всего зарегистрировано: <b>{total_users}</b>\n"
+        f"• Всего зарегистрировано: <b>{total_users}</b> (только с сайта: {web_only})\n"
         f"• В активном поиске: <b>{active_users}</b>\n"
         f"• С включенными пушами: <b>{notif_users}</b>\n"
         f"• Задано личных занятых часов: <b>{total_busy_slots}</b>\n\n"
         f"🏢 <b>Бизнес и конверсия:</b>\n"
         f"• Активных работодателей: <b>{total_employers}</b>\n"
         f"• Всего смен в системе: <b>{total_vacancies}</b>\n"
-        f"• Всего отправлено пушей: <b>{total_deliveries}</b>\n"
+        f"• Всего доставлено уведомлений: <b>{total_deliveries}</b>\n"
         f"• Всего откликов на работу: <b>{total_applications}</b>\n"
         f"• Средняя конверсия в отклик: <b>{conversion}</b>"
     )
     await message.answer(text)
+
+
+# ==================== РАЗДЕЛ «СМЕНЫ»: РЕЖИМ И ОЧЕРЕДЬ ====================
+
+@router.message(Command("work"))
+async def cmd_work_status(message: Message):
+    q = await queue_stats()
+    bots = ", ".join(f"{k} → {v}" for k, v in WORK_RELAY_BOTS.items()) or "не заданы"
+    testers = ", ".join(f"<code>{t}</code>" for t in sorted(WORK_TESTERS)) or "—"
+    mode = "🧪 тест — короткие уведомления только тестерам" if WORK_MODE != "live" else "🟢 боевой — всем подходящим"
+    await message.answer(
+        "💼 <b>Раздел «Смены»</b>\n\n"
+        f"• Режим: <b>{mode}</b>\n"
+        f"• Сайт виден: <b>{'всем' if WORK_WEB_ACCESS == 'all' else 'только тестерам'}</b>\n"
+        f"• Тестеры: {testers}\n"
+        f"• Боты факультетов: {html.escape(bots)}\n"
+        f"• Лимиты: {RELAY_MAX_PER_DAY}/день, {RELAY_MAX_PER_WEEK}/неделю, тихие часы {QUIET_FROM}:00–{QUIET_TO}:00\n\n"
+        "📨 <b>Короткие уведомления за сутки:</b>\n"
+        f"• Отправлено: <b>{q.get('sent', 0)}</b>\n"
+        f"• В очереди: <b>{q.get('pending', 0)}</b>\n"
+        f"• Бот заблокирован у студента: <b>{q.get('blocked', 0)}</b>\n"
+        f"• Не дошло после повторов: <b>{q.get('failed', 0)}</b>\n"
+        f"• Пропущено (смену сняли / началась): <b>{q.get('skipped', 0)}</b>\n"
+        f"• Всего отписались «Не присылать»: <b>{q.get('opted_out_total', 0)}</b>\n\n"
+        "<i>Режим и тестеры меняются переменными WORK_MODE и WORK_TESTERS на Render</i>"
+    )
+
+
+_DEMO = [
+    ("Ищем бариста в кофейню на Немиге, {d1} с 17:00 до 21:00. Оплата 45 руб за смену. Научим всему на месте", 1, (17, 0), (21, 0), 45, "BYN/смену"),
+    ("Промоутер в ТЦ Galleria Minsk, {d1} с 12 до 16, 10 руб/час. Раздаём дегустацию нового чая", 2, (12, 0), (16, 0), 10, "BYN/час"),
+    ("Помощник на склад книжного магазина, инвентаризация {d1}–{d2} с 10 до 15, 60 BYN за смену", 5, (10, 0), (15, 0), 60, "BYN/смену"),
+]
+
+
+@router.message(Command("demo"))
+async def cmd_demo(message: Message):
+    today = get_minsk_now().date()
+    now = get_minsk_now()
+    created = 0
+    async with work_session_maker() as session:
+        if not await session.get(Employer, DEMO_EMPLOYER_ID):
+            session.add(Employer(telegram_id=DEMO_EMPLOYER_ID, company_name="Демо-компания Aves", is_active=False))
+            await session.flush()
+        for tmpl, offset, (sh, sm), (eh, em), pay, unit in _DEMO:
+            first = today + timedelta(days=offset)
+            days = [first, first + timedelta(days=1)] if "{d2}" in tmpl else [first]
+            raw = tmpl.format(d1=first.strftime("%d.%m"), d2=days[-1].strftime("%d.%m"))
+            meta = describe(raw)
+            key = "demo" + uuid.uuid4().hex[:12]
+            for d in days:
+                session.add(Vacancy(
+                    employer_id=DEMO_EMPLOYER_ID, raw_text=raw, target_date=d, day_of_week=d.weekday(),
+                    start_time=time(sh, sm), end_time=time(eh, em), pay_amount=pay, pay_unit=unit,
+                    title=meta["title"], category=meta["category"], status="active", batch_key=key,
+                    require_all_days=len(days) > 1, is_demo=True, published_at=now,
+                ))
+                created += 1
+        await session.commit()
+    await message.answer(
+        f"🧪 Создано демо-смен: <b>{created}</b>\n"
+        "Их видят только тестеры — откройте раздел «Смены» на сайте.\n"
+        "Отклики на демо-смены приходят владельцу. Удалить: /demo_clear"
+    )
+
+
+@router.message(Command("demo_clear"))
+async def cmd_demo_clear(message: Message):
+    async with work_session_maker() as session:
+        res = await session.execute(delete(Vacancy).where(Vacancy.is_demo == True))
+        await session.commit()
+    await message.answer(f"🧹 Удалено демо-смен: <b>{res.rowcount or 0}</b>")
+
+
+@router.message(Command("relay_test"))
+async def cmd_relay_test(message: Message):
+    uid = message.from_user.id
+    forget_student(uid)
+    ref = await find_student(uid)
+    if not ref:
+        await message.answer("⚠️ Вы не выбрали группу ни в одном боте расписания — короткое уведомление некуда отправить.")
+        return
+    if ref.faculty not in WORK_RELAY_BOTS:
+        await message.answer(f"⚠️ Для факультета <b>{ref.faculty}</b> не задан бот в WORK_RELAY_BOTS.")
+        return
+
+    async with work_session_maker() as session:
+        vac = (await session.execute(
+            select(Vacancy)
+            .where(Vacancy.status == "active")
+            .where(Vacancy.target_date >= get_minsk_now().date())
+            .order_by(Vacancy.is_demo.desc(), Vacancy.target_date)
+            .limit(1)
+        )).scalar_one_or_none()
+        if not vac:
+            await message.answer("Нет активных смен. Сначала создайте демо: /demo")
+            return
+        now = get_minsk_now()
+        await session.execute(
+            pg_insert(RelayOutbox).values(
+                user_id=uid, faculty=ref.faculty, vacancy_id=vac.id, status="pending",
+                attempts=0, not_before=now, created_at=now,
+            ).on_conflict_do_update(
+                constraint="uq_relay_user_vacancy",
+                set_={"status": "pending", "attempts": 0, "not_before": now, "error": None},
+            )
+        )
+        await session.commit()
+    await message.answer(
+        f"📨 Поставлено в очередь: смена #{vac.id} → бот факультета <b>{ref.faculty}</b>.\n"
+        "Придёт в течение ~20 секунд (если бот факультета спит — до минуты). Статус: /work"
+    )
 
 
 # ==================== ТЕХНИЧЕСКАЯ РАССЫЛКА ====================
@@ -210,7 +346,7 @@ async def cmd_tech_broadcast(message: Message, command: CommandObject, bot: Bot)
 
     async with work_session_maker() as session:
         user_ids = (await session.execute(
-            select(WorkUser.telegram_id).where(WorkUser.is_active == True)
+            select(WorkUser.telegram_id).where(WorkUser.is_active == True).where(WorkUser.bot_started == True)
         )).scalars().all()
 
     total = len(user_ids)

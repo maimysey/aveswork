@@ -3,10 +3,15 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    WebAppInfo,
 )
+from config import AVES_SITE_URL
 from models import UserBusySlot, Vacancy
 
 DAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+# Лента смен на сайте внутри Telegram (вход по initData этого бота)
+FEED_WEBAPP_URL = f"{AVES_SITE_URL}/app/?via=work&tab=work"
 
 
 # ==================== КЛАВИАТУРЫ ГЛАВНОГО МЕНЮ ====================
@@ -24,10 +29,18 @@ def student_main_menu_kb() -> ReplyKeyboardMarkup:
 def employer_main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📝 Инструкция к публикации"), KeyboardButton(text="📊 Мои публикации")],
+            [KeyboardButton(text="📝 Инструкция к публикации"), KeyboardButton(text="📊 Мои смены")],
             [KeyboardButton(text="ℹ️ О сервисе"), KeyboardButton(text="💬 Связь с поддержкой")],
         ],
         resize_keyboard=True,
+    )
+
+
+def open_feed_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="📋 Все смены под моё расписание", web_app=WebAppInfo(url=FEED_WEBAPP_URL))
+        ]]
     )
 
 
@@ -78,6 +91,7 @@ def student_settings_kb(is_active: bool, notifications_enabled: bool) -> InlineK
             [InlineKeyboardButton(text=search_label, callback_data="toggle_search_status")],
             [InlineKeyboardButton(text=notif_label, callback_data="toggle_notif_status")],
             [InlineKeyboardButton(text="⏳ Настроить занятые часы", callback_data="add_busy_slot")],
+            [InlineKeyboardButton(text="📋 Лента смен", web_app=WebAppInfo(url=FEED_WEBAPP_URL))],
         ]
     )
 
@@ -109,7 +123,7 @@ def employer_preview_kb(
 
     mode_int = 1 if require_all_days else 0
     keyboard.extend([
-        [InlineKeyboardButton(text="🚀 Запустить рассылку кандидатам", callback_data=f"send_vac_{ids_str}_{mode_int}")],
+        [InlineKeyboardButton(text="🚀 Опубликовать и разослать", callback_data=f"send_vac_{ids_str}_{mode_int}")],
         [InlineKeyboardButton(text="🗑 Отменить публикацию", callback_data=f"cancel_vac_{ids_str}")],
     ])
 

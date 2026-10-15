@@ -5,11 +5,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select
 
-from config import logger
 from database import work_session_maker
-from models import WorkUser, UserBusySlot, Vacancy, VacancyDelivery, Employer
+from models import UserBusySlot
+from services.applications import apply_to_shift
 from services.nlp_parser import parse_user_busy_input
-from services.metrics import metrics_service
 from keyboards import (
     student_busy_menu_kb,
     cancel_busy_input_kb,
@@ -192,55 +191,37 @@ async def cb_delete_busy_slot(callback: CallbackQuery):
 
 # ==================== ОТКЛИК НА СМЕНУ ====================
 
+_APPLY_ALERTS = {
+    "gone": "К сожалению, эта смена уже закрыта или отменена",
+    "past": "Эта смена уже началась",
+    "own": "Это ваша собственная смена",
+    "already": "Вы уже откликнулись — работодатель видит ваш контакт",
+}
+
+
 @router.callback_query(F.data.startswith("apply_"))
 async def cb_apply_to_vacancy(callback: CallbackQuery, bot: Bot):
     vac_id = int(callback.data.split("_")[1])
     student = callback.from_user
 
-    async with work_session_maker() as session:
-        vac = await session.get(Vacancy, vac_id)
-        if not vac:
-            await callback.answer("К сожалению, эта смена уже закрыта или отменена", show_alert=True)
-            return
-
-        emp = await session.get(Employer, vac.employer_id)
-
-        delivery = (await session.execute(
-            select(VacancyDelivery)
-            .where(VacancyDelivery.vacancy_id == vac.id)
-            .where(VacancyDelivery.user_id == student.id)
-        )).scalar_one_or_none()
-
-        if delivery:
-            delivery.status = "applied"
-        else:
-            session.add(VacancyDelivery(vacancy_id=vac.id, user_id=student.id, status="applied"))
-
-        await session.commit()
-
-    metrics_service.track_application()
+    status, _ = await apply_to_shift(
+        bot, vac_id, student.id, name=student.first_name, username=student.username, source="bot"
+    )
+    if status not in ("ok", "already"):
+        await callback.answer(_APPLY_ALERTS[status], show_alert=True)
+        return
 
     try:
         await callback.message.edit_reply_markup(reply_markup=student_applied_kb())
     except Exception:
         pass
 
-    await callback.answer("🎉 Отклик отправлен работодателю!", show_alert=True)
+    if status == "already":
+        await callback.answer(_APPLY_ALERTS["already"], show_alert=True)
+    else:
+        await callback.answer("🎉 Отклик отправлен работодателю!", show_alert=True)
 
-    # Уведомление менеджеру
-    if emp and emp.is_active:
-        user_mention = f"@{student.username}" if student.username else f"<a href='tg://user?id={student.id}'>{html.escape(student.first_name)}</a>"
-        shift_date_str = vac.target_date.strftime("%d.%m")
-        shift_time_str = f"{vac.start_time.strftime('%H:%M')}–{vac.end_time.strftime('%H:%M')}"
 
-        notif_text = (
-            f"🔔 <b>Новый отклик на смену!</b>\n\n"
-            f"🗓 Смена: <b>{shift_date_str} ({shift_time_str})</b>\n"
-            f"👤 Соискатель: <b>{user_mention}</b> (ID: <code>{student.id}</code>)\n\n"
-            f"<i>Свяжитесь со студентом для подтверждения выхода:</i> {user_mention}"
-        )
-
-        try:
-            await bot.send_message(chat_id=emp.telegram_id, text=notif_text)
-        except Exception as e:
-            logger.warning(f"Не удалось доставить уведомление об отклике менеджеру {emp.telegram_id}: {e}")
+@router.callback_query(F.data == "already_applied")
+async def cb_already_applied(callback: CallbackQuery):
+    await callback.answer(_APPLY_ALERTS["already"])

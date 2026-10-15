@@ -1,17 +1,21 @@
 import asyncio
 import html
+import uuid
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import BaseFilter
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
-from config import logger, OWNER_USERNAME
+from config import logger, OWNER_USERNAME, WORK_MODE, get_minsk_now
 from database import work_session_maker
-from models import Employer, Vacancy, VacancyDelivery
+from models import Employer, Vacancy, VacancyDelivery, WorkUser
 from services.nlp_parser import parse_vacancy_card
-from services.matcher import find_available_candidates_batch
+from services.matcher import Audience, build_audience
 from services.metrics import metrics_service
+from services.relay import enqueue as enqueue_relay
+from services.shift_format import pay_text
+from services.shift_meta import describe
 from keyboards import (
     employer_preview_kb,
     student_vacancy_card_kb,
@@ -26,12 +30,13 @@ DAYS_NAMES = [
     "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"
 ]
 
+MY_SHIFTS_BUTTONS = {"📊 Мои смены", "📊 Мои публикации"}
+
 EMPLOYER_MENU_BUTTONS = {
     "📝 Инструкция к публикации",
-    "📊 Мои смены",
     "ℹ️ О сервисе",
     "💬 Связь с поддержкой",
-}
+} | MY_SHIFTS_BUTTONS
 
 
 # ==================== ФИЛЬТР: ТОЛЬКО АВТОРИЗОВАННЫЙ РАБОТОДАТЕЛЬ ====================
@@ -56,7 +61,8 @@ async def cmd_instruction(message: Message):
         "• <i>«Ищем бариста 29.09 с 16:00 до 21:00. Оплата 45 руб. Кофейня на Немиге»</i>\n"
         "• <i>«Курьер в четверг и пятницу с 17 до 21. 50 BYN за смену»</i>\n"
         "• <i>«Помощник на склад с 28.09 по 30.09 с 12 до 18, 10 руб/час.»</i>\n\n"
-        "Бот автоматически распознает даты, проверит расписание студентов БГУ и покажет аудиторию перед отправкой"
+        "Бот автоматически распознает даты, проверит расписание студентов БГУ и покажет аудиторию перед отправкой. "
+        "Смена сразу появится в ленте «Смены» на сайте у тех, кому она подходит"
     )
     await message.answer(text)
 
@@ -83,11 +89,13 @@ async def _render_vacancies_list(user_id: int) -> tuple[str, any]:
         vacancies = (await session.execute(
             select(Vacancy)
             .where(Vacancy.employer_id == user_id)
+            .where(Vacancy.status != "draft")
             .order_by(Vacancy.target_date.desc(), Vacancy.start_time.asc())
+            .limit(40)
         )).scalars().all()
 
         if not vacancies:
-            return "📋 <b>У вас пока нет активных смен.</b>\nОтправьте текст смены в чат, чтобы создать новую!", None
+            return "📋 <b>У вас пока нет опубликованных смен.</b>\nОтправьте текст смены в чат, чтобы создать новую!", None
 
         # Считаем отклики для каждой смены
         app_counts = (await session.execute(
@@ -108,7 +116,7 @@ async def _render_vacancies_list(user_id: int) -> tuple[str, any]:
     return text, kb
 
 
-@router.message(F.text == "📊 Мои смены", IsEmployerFilter())
+@router.message(F.text.in_(MY_SHIFTS_BUTTONS), IsEmployerFilter())
 async def cmd_my_vacancies(message: Message):
     text, kb = await _render_vacancies_list(message.from_user.id)
     await message.answer(text, reply_markup=kb)
@@ -134,10 +142,12 @@ async def cb_manage_vacancy(callback: CallbackQuery):
             await callback.answer("Смена не найдена или уже удалена", show_alert=True)
             return
 
-        total_sent = await session.scalar(
-            select(func.count(VacancyDelivery.id))
+        sent_rows = (await session.execute(
+            select(VacancyDelivery.status, func.count(VacancyDelivery.id))
             .where(VacancyDelivery.vacancy_id == vac.id)
-        ) or 0
+            .group_by(VacancyDelivery.status)
+        )).all()
+        by_status = dict(sent_rows)
 
         applied_deliveries = (await session.execute(
             select(VacancyDelivery.user_id)
@@ -145,17 +155,21 @@ async def cb_manage_vacancy(callback: CallbackQuery):
             .where(VacancyDelivery.status == "applied")
         )).scalars().all()
 
+    total_sent = sum(by_status.values())
     day_title = DAYS_NAMES[vac.day_of_week]
     date_str = vac.target_date.strftime("%d.%m.%Y")
     time_str = f"{vac.start_time.strftime('%H:%M')} — {vac.end_time.strftime('%H:%M')}"
-    pay_str = f"{vac.pay_amount} {vac.pay_unit}" if vac.pay_amount else "По договоренности"
+    pay_str = pay_text(vac.pay_amount, vac.pay_unit) or "По договоренности"
+    status_str = {"active": "🟢 Опубликована", "closed": "⚪ Снята", "draft": "📝 Черновик"}.get(vac.status, vac.status)
 
     lines = [
         f"📋 <b>Управление сменой #{vac.id}</b>\n",
+        f"📌 <b>Статус:</b> {status_str}",
         f"🗓 <b>Дата:</b> {day_title} ({date_str})",
         f"⏰ <b>Время:</b> {time_str}",
         f"💰 <b>Оплата:</b> {pay_str}",
-        f"📬 <b>Доставлено пушей студентам:</b> {total_sent} чел.",
+        f"📬 <b>Узнали о смене:</b> {total_sent} чел. "
+        f"(карточка в AvesWork: {by_status.get('sent', 0)}, коротко в боте расписания: {by_status.get('relay', 0)})",
         f"🙋‍♂️ <b>Откликов:</b> {len(applied_deliveries)} чел.\n",
         f"📝 <b>Текст вакансии:</b>\n<i>{html.escape(vac.raw_text)}</i>\n",
     ]
@@ -195,21 +209,27 @@ async def cb_delete_vacancy(callback: CallbackQuery):
 
 # ==================== ВСПОМОГАТЕЛЬНЫЙ ФОРМАТТЕР ПРЕВЬЮ ====================
 
+def _relay_note() -> str:
+    if WORK_MODE == "live":
+        return "коротко в боте расписания"
+    return "коротко в боте расписания — <i>тестовый режим, только тестерам</i>"
+
+
 def _build_preview_text(
     company_name: str,
     vacancies: list[Vacancy],
-    breakdown: list[dict],
-    total_potential: int,
-    ready_count: int,
+    aud: Audience,
     require_all_days: bool,
 ) -> str:
     first_vac = vacancies[0]
     time_str = f"{first_vac.start_time.strftime('%H:%M')} — {first_vac.end_time.strftime('%H:%M')}"
-    pay_str = f"<b>{first_vac.pay_amount} {first_vac.pay_unit}</b>" if first_vac.pay_amount else "<i>По договоренности</i>"
+    pay = pay_text(first_vac.pay_amount, first_vac.pay_unit)
+    pay_str = f"<b>{pay}</b>" if pay else "<i>По договоренности</i>"
 
     lines = [
         "📋 <b>Параметры смены распознаны:</b>\n",
         f"🏢 Компания: <b>{html.escape(company_name)}</b>",
+        f"🏷 Должность: <b>{html.escape(first_vac.title or 'Смена')}</b>",
         f"⏰ Время: <b>{time_str}</b>",
         f"💰 Оплата: {pay_str}\n",
     ]
@@ -221,29 +241,46 @@ def _build_preview_text(
         lines.append(f"🗓 Дата: <b>{day_title} ({date_str})</b>\n")
     else:
         lines.append(f"🗓 <b>Смены на {len(vacancies)} дня:</b>")
-        for b in breakdown:
+        for b in aud.breakdown:
             d_title = DAYS_NAMES[b["day_of_week"]]
             d_str = b["target_date"].strftime("%d.%m")
             lines.append(
                 f"• <b>{d_title} ({d_str}):</b> свободно {b['potential_count']} студ. "
-                f"(пуш получат: {b['ready_count']})"
+                f"(карточка: {b['ready_count']}, коротко: {b['relay_count']})"
             )
         lines.append("")
 
         if require_all_days:
-            mode_desc = "🎯 <b>Режим: Нужен на ВСЕ дни сразу</b>\n<i>(Пуш получат только те, кто свободен во все указанные дни)</i>"
+            mode_desc = "🎯 <b>Режим: Нужен на ВСЕ дни сразу</b>\n<i>(Узнают только те, кто свободен во все указанные дни)</i>"
         else:
-            mode_desc = "🔀 <b>Режим: Можно по отдельным дням</b>\n<i>(Пуш получат те, кто свободен хотя бы в один из дней)</i>"
+            mode_desc = "🔀 <b>Режим: Можно по отдельным дням</b>\n<i>(Узнают те, кто свободен хотя бы в один из дней)</i>"
         lines.append(f"{mode_desc}\n")
 
     lines.extend([
         "📊 <b>Аналитика аудитории:</b>",
-        f"• 👥 Всего подходит студентов БГУ: <b>{total_potential} чел.</b>",
-        f"• ⚡ Активных соискателей получат пуш: <b>{ready_count} чел.</b>\n",
+        f"• 👥 Свободно по расписанию: <b>{len(aud.potential)} чел.</b>",
+        f"• ⚡ Получат карточку в AvesWork: <b>{len(aud.push)} чел.</b>",
+        f"• 💬 Получат {_relay_note()}: <b>до {len(aud.relay)} чел.</b>",
+        "• 🌐 Смена появится в ленте на сайте у всех, кому подходит по времени\n",
         "<i>Подтвердите публикацию для запуска адресного поиска:</i>"
     ])
 
     return "\n".join(lines)
+
+
+async def _load_vacancies(vac_ids: list[int]) -> tuple[list[Vacancy], str]:
+    async with work_session_maker() as session:
+        vacancies = (await session.execute(
+            select(Vacancy).where(Vacancy.id.in_(vac_ids)).order_by(Vacancy.target_date.asc())
+        )).scalars().all()
+        if not vacancies:
+            return [], ""
+        emp = await session.get(Employer, vacancies[0].employer_id)
+    return list(vacancies), (emp.company_name if emp else "Компания")
+
+
+def _shifts(vacancies: list[Vacancy]) -> list[dict]:
+    return [{"target_date": v.target_date, "day_of_week": v.day_of_week} for v in vacancies]
 
 
 # ==================== ПРИЕМ И ПАРСИНГ ТЕКСТА СМЕНЫ ====================
@@ -265,6 +302,9 @@ async def handle_employer_vacancy_post(message: Message):
         )
         return
 
+    meta = describe(parsed["raw_text"])
+    batch_key = uuid.uuid4().hex[:16]
+
     created_vacancies: list[Vacancy] = []
     async with work_session_maker() as session:
         for s in parsed["shifts"]:
@@ -277,6 +317,10 @@ async def handle_employer_vacancy_post(message: Message):
                 end_time=parsed["end_time"],
                 pay_amount=parsed["pay_amount"],
                 pay_unit=parsed["pay_unit"],
+                title=meta["title"],
+                category=meta["category"],
+                status="draft",
+                batch_key=batch_key,
             )
             session.add(vac)
             created_vacancies.append(vac)
@@ -287,26 +331,12 @@ async def handle_employer_vacancy_post(message: Message):
 
     metrics_service.track_vacancy_created()
 
-    shifts_data = [{"target_date": v.target_date, "day_of_week": v.day_of_week} for v in created_vacancies]
-    total_potential, ready_candidates, breakdown = await find_available_candidates_batch(
-        shifts=shifts_data,
-        shift_start=parsed["start_time"],
-        shift_end=parsed["end_time"],
-        require_all_days=False,
-    )
+    aud = await build_audience(_shifts(created_vacancies), parsed["start_time"], parsed["end_time"], False)
 
     vac_ids = [v.id for v in created_vacancies]
     is_multi = len(created_vacancies) > 1
 
-    text = _build_preview_text(
-        company_name=employer.company_name,
-        vacancies=created_vacancies,
-        breakdown=breakdown,
-        total_potential=total_potential,
-        ready_count=len(ready_candidates),
-        require_all_days=False,
-    )
-
+    text = _build_preview_text(employer.company_name, created_vacancies, aud, require_all_days=False)
     await message.answer(
         text,
         reply_markup=employer_preview_kb(vac_ids, require_all_days=False, is_multi_day=is_multi)
@@ -322,37 +352,14 @@ async def cb_toggle_mode(callback: CallbackQuery):
     new_require_all = bool(int(parts[3]))
 
     vac_ids = [int(x) for x in ids_str.split(",") if x.isdigit()]
+    vacancies, company_name = await _load_vacancies(vac_ids)
+    if not vacancies:
+        await callback.answer("Смены устарели или были удалены", show_alert=True)
+        return
 
-    async with work_session_maker() as session:
-        vacancies = (await session.execute(
-            select(Vacancy).where(Vacancy.id.in_(vac_ids)).order_by(Vacancy.target_date.asc())
-        )).scalars().all()
-
-        if not vacancies:
-            await callback.answer("Смены устарели или были удалены", show_alert=True)
-            return
-
-        emp = await session.get(Employer, vacancies[0].employer_id)
-        company_name = emp.company_name if emp else "Компания"
-
-    shifts_data = [{"target_date": v.target_date, "day_of_week": v.day_of_week} for v in vacancies]
     first_v = vacancies[0]
-
-    total_potential, ready_candidates, breakdown = await find_available_candidates_batch(
-        shifts=shifts_data,
-        shift_start=first_v.start_time,
-        shift_end=first_v.end_time,
-        require_all_days=new_require_all,
-    )
-
-    text = _build_preview_text(
-        company_name=company_name,
-        vacancies=list(vacancies),
-        breakdown=breakdown,
-        total_potential=total_potential,
-        ready_count=len(ready_candidates),
-        require_all_days=new_require_all,
-    )
+    aud = await build_audience(_shifts(vacancies), first_v.start_time, first_v.end_time, new_require_all)
+    text = _build_preview_text(company_name, vacancies, aud, new_require_all)
 
     try:
         await callback.message.edit_text(
@@ -389,52 +396,23 @@ async def cb_cancel_vacancy(callback: CallbackQuery):
 
 # ==================== ЗАПУСК РАССЫЛКИ ====================
 
-@router.callback_query(F.data.startswith("send_vac_"))
-async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
-    parts = callback.data.split("_")
-    ids_str = parts[2]
-    require_all_days = bool(int(parts[3])) if len(parts) > 3 else False
-
-    vac_ids = [int(x) for x in ids_str.split(",") if x.isdigit()]
-
-    async with work_session_maker() as session:
-        vacancies = (await session.execute(
-            select(Vacancy).where(Vacancy.id.in_(vac_ids)).order_by(Vacancy.target_date.asc())
-        )).scalars().all()
-
-        if not vacancies:
-            await callback.answer("Смены не найдены", show_alert=True)
-            return
-
-        emp = await session.get(Employer, vacancies[0].employer_id)
-        company_name = emp.company_name if emp else "Компания"
-
-    await callback.message.edit_text("⏳ <b>Идет подбор кандидатов и рассылка пушей...</b>")
-
-    shifts_data = [{"target_date": v.target_date, "day_of_week": v.day_of_week} for v in vacancies]
+def student_card_text(company_name: str, vacancies: list[Vacancy], require_all_days: bool) -> str:
     first_v = vacancies[0]
-
-    total_potential, ready_candidate_ids, _ = await find_available_candidates_batch(
-        shifts=shifts_data,
-        shift_start=first_v.start_time,
-        shift_end=first_v.end_time,
-        require_all_days=require_all_days,
-    )
-
     time_str = f"{first_v.start_time.strftime('%H:%M')} – {first_v.end_time.strftime('%H:%M')}"
-    pay_line = f"💰 Оплата: <b>{first_v.pay_amount} {first_v.pay_unit}</b>\n" if first_v.pay_amount else ""
+    pay = pay_text(first_v.pay_amount, first_v.pay_unit)
+    pay_line = f"💰 Оплата: <b>{pay}</b>\n" if pay else ""
 
     if len(vacancies) == 1:
         v = vacancies[0]
         date_header = f"🗓 Дата: <b>{DAYS_NAMES[v.day_of_week]} ({v.target_date.strftime('%d.%m')})</b>"
     else:
         days_list = [f"{DAYS_NAMES[v.day_of_week]} ({v.target_date.strftime('%d.%m')})" for v in vacancies]
-        days_joined = ", ".join(days_list)
         mode_note = " <i>(нужен человек на все дни)</i>" if require_all_days else ""
-        date_header = f"🗓 Даты: <b>{days_joined}</b>{mode_note}"
+        date_header = f"🗓 Даты: <b>{', '.join(days_list)}</b>{mode_note}"
 
-    student_card_text = (
+    return (
         f"⚡ <b>Новая смена под твое расписание!</b>\n\n"
+        f"🏷 <b>{html.escape(first_v.title or 'Смена')}</b>\n"
         f"🏢 Работодатель: <b>{html.escape(company_name)}</b>\n"
         f"{date_header}\n"
         f"⏰ Время: <b>{time_str}</b>\n"
@@ -443,48 +421,102 @@ async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
         f"{html.escape(first_v.raw_text)}"
     )
 
-    sent_count = 0
-    primary_vac_id = vacancies[0].id
 
+async def _send_card(bot: Bot, uid: int, text: str, vac_id: int) -> str:
+    """sent | blocked | error"""
+    for attempt in range(2):
+        try:
+            await bot.send_message(chat_id=uid, text=text, reply_markup=student_vacancy_card_kb(vac_id))
+            return "sent"
+        except TelegramForbiddenError:
+            return "blocked"
+        except TelegramRetryAfter as e:
+            if attempt == 0:
+                await asyncio.sleep(e.retry_after)
+                continue
+            return "error"
+        except Exception:
+            return "error"
+    return "error"
+
+
+@router.callback_query(F.data.startswith("send_vac_"))
+async def cb_broadcast_vacancy(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    ids_str = parts[2]
+    require_all_days = bool(int(parts[3])) if len(parts) > 3 else False
+
+    vac_ids = [int(x) for x in ids_str.split(",") if x.isdigit()]
+    vacancies, company_name = await _load_vacancies(vac_ids)
+    if not vacancies:
+        await callback.answer("Смены не найдены", show_alert=True)
+        return
+    if vacancies[0].status == "active":
+        await callback.answer("Эта смена уже опубликована", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ <b>Идет подбор кандидатов и рассылка...</b>")
+
+    # 1. Публикуем: смена сразу появляется в ленте на сайте
     async with work_session_maker() as session:
-        for uid in ready_candidate_ids:
-            try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=student_card_text,
-                    reply_markup=student_vacancy_card_kb(primary_vac_id),
-                )
+        await session.execute(
+            update(Vacancy)
+            .where(Vacancy.id.in_(vac_ids))
+            .values(status="active", published_at=get_minsk_now(), require_all_days=require_all_days)
+        )
+        await session.commit()
+    for v in vacancies:
+        v.status, v.require_all_days = "active", require_all_days
+
+    first_v = vacancies[0]
+    aud = await build_audience(_shifts(vacancies), first_v.start_time, first_v.end_time, require_all_days)
+
+    # 2. Полные карточки в AvesWork
+    card = student_card_text(company_name, vacancies, require_all_days)
+    sent_count = 0
+    blocked: list[int] = []
+    async with work_session_maker() as session:
+        for uid in aud.push:
+            res = await _send_card(bot, uid, card, first_v.id)
+            if res == "sent":
                 for v in vacancies:
                     session.add(VacancyDelivery(vacancy_id=v.id, user_id=uid, status="sent"))
                 sent_count += 1
-            except TelegramForbiddenError:
-                pass
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                try:
-                    await bot.send_message(
-                        chat_id=uid,
-                        text=student_card_text,
-                        reply_markup=student_vacancy_card_kb(primary_vac_id),
-                    )
-                    for v in vacancies:
-                        session.add(VacancyDelivery(vacancy_id=v.id, user_id=uid, status="sent"))
-                    sent_count += 1
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
+            elif res == "blocked":
+                blocked.append(uid)
             await asyncio.sleep(0.04)
 
+        if blocked:
+            # Остановил бота — дальше сообщаем ему через бота расписания
+            await session.execute(
+                update(WorkUser).where(WorkUser.telegram_id.in_(blocked)).values(bot_started=False)
+            )
         await session.commit()
 
     metrics_service.track_deliveries_sent(sent_count)
 
+    # 3. Короткие уведомления через ботов расписания (очередь, лимиты, тихие часы)
+    relay_targets = dict(aud.relay)
+    relay_stats = await enqueue_relay(vacancies, relay_targets)
+
+    relay_line = f"💬 Коротко в боте расписания: <b>{relay_stats['queued']} чел.</b>"
+    if relay_stats["deferred"] and relay_stats["queued"]:
+        relay_line += " <i>(сейчас ночь — уйдут утром)</i>"
+    elif relay_stats["queued"]:
+        relay_line += " <i>(уходят в течение пары минут)</i>"
+    if relay_stats["limited"]:
+        relay_line += f"\n<i>Ещё {relay_stats['limited']} чел. уже получили сегодня максимум уведомлений</i>"
+    if WORK_MODE != "live":
+        relay_line += "\n<i>Тестовый режим: короткие уведомления получают только тестеры</i>"
+
     await callback.message.edit_text(
-        f"✅ <b>Рассылка успешно выполнена!</b>\n\n"
-        f"📬 Доставлено активным кандидатам: <b>{sent_count} чел.</b>\n"
-        f"🌐 Всего свободно студентов в эти дни: <b>{total_potential} чел.</b>\n\n"
+        f"✅ <b>Смена опубликована!</b>\n\n"
+        f"📬 Карточка в AvesWork: <b>{sent_count} чел.</b>\n"
+        f"{relay_line}\n"
+        f"🌐 Свободно по расписанию: <b>{len(aud.potential)} чел.</b> — они видят смену в ленте на сайте\n\n"
         f"<i>Как только появятся первые отклики, бот сразу пришлет контакты студентов в этот чат!</i>"
     )
     await callback.answer()
+    logger.info(
+        f"💼 Смена {vac_ids} опубликована: push={sent_count}, relay={relay_stats}, potential={len(aud.potential)}"
+    )

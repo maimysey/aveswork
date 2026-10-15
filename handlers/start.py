@@ -1,23 +1,41 @@
 import html
 from aiogram import Router, F
 from aiogram.types import Message
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, CommandObject
 from aiogram.enums import ChatType
-from sqlalchemy import select
 
 from config import OWNER_USERNAME, logger
-from database import work_session_maker, FACULTY_SESSIONS
-from models import Employer, WorkUser, FacultyUser
-from keyboards import student_main_menu_kb, employer_main_menu_kb
+from database import work_session_maker
+from models import Employer, Vacancy, WorkUser
+from keyboards import student_main_menu_kb, employer_main_menu_kb, open_feed_kb, student_vacancy_card_kb
+from services.availability import find_student, forget_student
+from services.shift_format import is_upcoming
 
 router = Router()
 
 
+async def _send_shift_card(message: Message, vac_id: int) -> None:
+    """Глубокая ссылка t.me/<бот>?start=v<id> — с сайта или из короткого уведомления."""
+    from handlers.employer import student_card_text
+
+    async with work_session_maker() as session:
+        vac = await session.get(Vacancy, vac_id)
+        emp = await session.get(Employer, vac.employer_id) if vac else None
+    if not vac or vac.status != "active" or not is_upcoming(vac):
+        await message.answer("⌛ Эта смена уже закрыта. Остальные — в ленте:", reply_markup=open_feed_kb())
+        return
+    await message.answer(
+        student_card_text(emp.company_name if emp else "Компания", [vac], vac.require_all_days),
+        reply_markup=student_vacancy_card_kb(vac.id),
+    )
+
+
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, command: CommandObject):
     user_id = message.from_user.id
     first_name = message.from_user.first_name or "Студент"
     safe_name = html.escape(first_name)
+    payload = (command.args or "").strip()
 
     # 1. Проверяем, является ли пользователь авторизованным работодателем
     async with work_session_maker() as session:
@@ -47,27 +65,18 @@ async def cmd_start(message: Message):
                 telegram_id=user_id,
                 is_active=True,
                 notifications_enabled=True,
+                bot_started=True,
             )
             session.add(user)
-            await session.commit()
             logger.info(f"✨ Зарегистрирован соискатель: ID {user_id}")
+        elif not user.bot_started:
+            # Профиль создавался на сайте — теперь бот может писать сам
+            user.bot_started = True
+        await session.commit()
 
     # 3. Проверка наличия расписания в базах факультетов (Биофак, ФСК)
-    is_synced = False
-    for fac_code, session_maker in FACULTY_SESSIONS.items():
-        try:
-            async with session_maker() as fac_session:
-                fac_user = (await fac_session.execute(
-                    select(FacultyUser)
-                    .where(FacultyUser.telegram_id == user_id)
-                    .where(FacultyUser.group_id.is_not(None))
-                )).scalar_one_or_none()
-
-                if fac_user:
-                    is_synced = True
-                    break
-        except Exception:
-            pass
+    forget_student(user_id)
+    is_synced = (await find_student(user_id)) is not None
 
     # 4. Формирование подсказки о синхронизации с учебой
     if is_synced:
@@ -93,3 +102,8 @@ async def cmd_start(message: Message):
     )
 
     await message.answer(greeting_text, reply_markup=student_main_menu_kb())
+
+    if payload.startswith("v") and payload[1:].isdigit():
+        await _send_shift_card(message, int(payload[1:]))
+    else:
+        await message.answer("Все актуальные смены под ваше расписание:", reply_markup=open_feed_kb())

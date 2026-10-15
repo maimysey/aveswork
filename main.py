@@ -1,15 +1,20 @@
+import asyncio
 import os
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from config import BOT_TOKEN, logger
-from database import work_engine, dispose_all_engines
+from config import BOT_TOKEN, WORK_MODE, logger
+from database import migrate_work_schema, dispose_all_engines
 from models import WorkBase
 from middlewares.metrics_middleware import MetricsMiddleware
 from handlers import admin, employer, student, settings, start
+from keyboards import FEED_WEBAPP_URL
+from services.relay import relay_worker, setup_relay_routes
+from services.webapp_work_api import setup_work_api
 
 # Настройки Webhook и сервера
 WEBHOOK_PATH = "/webhook"
@@ -17,6 +22,8 @@ BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL", "https://aveswork.onrender.com"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", None)
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
+
+background_tasks: list[asyncio.Task] = []
 
 
 async def handle_ping(request: web.Request) -> web.Response:
@@ -26,10 +33,8 @@ async def handle_ping(request: web.Request) -> web.Response:
 async def on_startup(bot: Bot):
     logger.info("🔄 Инициализация сервиса AvesWork и проверка БД...")
 
-    # 1. Создание только рабочих таблиц AvesWork в основной базе Supabase
-    async with work_engine.begin() as conn:
-        await conn.run_sync(WorkBase.metadata.create_all)
-    logger.info("✅ Таблицы AvesWork успешно инициализированы в Supabase")
+    # 1. Таблицы AvesWork + новые колонки (статус смены, название, связка с ботами)
+    await migrate_work_schema(WorkBase.metadata)
 
     # 2. Установка вебхука Telegram
     webhook_url = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -41,9 +46,26 @@ async def on_startup(bot: Bot):
     )
     logger.info("🚀 Вебхук установлен. Сервис готов принимать смены и отклики!")
 
+    # 3. Кнопка «Смены» слева от поля ввода — лента на сайте внутри Telegram
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Смены", web_app=WebAppInfo(url=FEED_WEBAPP_URL))
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось установить кнопку ленты: {e}")
+
+    # 4. Очередь коротких уведомлений через ботов факультетов
+    background_tasks.append(asyncio.create_task(relay_worker()))
+    logger.info(f"💼 Раздел «Смены» работает в режиме: {WORK_MODE}")
+
 
 async def on_shutdown(bot: Bot):
     logger.info("🛑 Остановка сервиса AvesWork...")
+
+    for task in background_tasks:
+        task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
 
     # Закрытие сессии бота и всех сетевых пулов к Supabase
     await bot.session.close()
@@ -81,6 +103,10 @@ def main():
     # Healthcheck
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_ping)
+
+    # Раздел «Смены» на сайте (/api/work/*) и связка с ботами факультетов (/internal/*)
+    setup_work_api(app, bot)
+    setup_relay_routes(app)
 
     # Обработчик вебхуков
     webhook_handler = SimpleRequestHandler(
