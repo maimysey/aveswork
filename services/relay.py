@@ -107,6 +107,24 @@ async def set_relay_pref(uid: int, enabled: bool) -> None:
         await session.commit()
 
 
+async def on_blocked(uid: int, faculty: str) -> None:
+    """Бот факультета у студента заблокирован. Есть другой бот расписания — пишем через него, иначе выключаем."""
+    from services.availability import faculty_order, find_students
+
+    others = [f for f in faculty_order({r.faculty for r in await find_students(uid)})
+              if f != faculty and f in WORK_RELAY_BOTS]
+    async with work_session_maker() as session:
+        pref = await session.get(WorkPref, uid)
+        if not pref:
+            pref = WorkPref(telegram_id=uid, relay_enabled=True, schedules_off="")
+            session.add(pref)
+        if others:
+            pref.relay_faculty = others[0]
+        else:
+            pref.relay_enabled = False
+        await session.commit()
+
+
 async def get_relay_pref(uid: int) -> bool:
     async with work_session_maker() as session:
         pref = await session.get(WorkPref, uid)
@@ -264,7 +282,7 @@ async def _apply_results(rows: list[RelayOutbox], results: dict[str, str], error
                          batches: dict[int, list[Vacancy]]) -> int:
     now = get_minsk_now()
     sent = 0
-    blocked: list[int] = []
+    blocked: list[tuple[int, str]] = []
     async with work_session_maker() as session:
         for r in rows:
             res = results.get(str(r.user_id))
@@ -276,7 +294,7 @@ async def _apply_results(rows: list[RelayOutbox], results: dict[str, str], error
                     session.add(VacancyDelivery(vacancy_id=v.id, user_id=r.user_id, status="relay"))
             elif res in ("blocked", "banned"):
                 values = {"status": "blocked", "error": res}
-                blocked.append(r.user_id)
+                blocked.append((r.user_id, r.faculty))
             else:
                 attempts = (r.attempts or 0) + 1
                 values = {
@@ -287,8 +305,8 @@ async def _apply_results(rows: list[RelayOutbox], results: dict[str, str], error
                 }
             await session.execute(update(RelayOutbox).where(RelayOutbox.id == r.id).values(**values))
         await session.commit()
-    for uid in blocked:
-        await set_relay_pref(uid, False)  # бот факультета у него заблокирован — больше не пробуем
+    for uid, faculty in blocked:
+        await on_blocked(uid, faculty)
     return sent
 
 

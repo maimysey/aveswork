@@ -8,7 +8,7 @@ from config import OWNER_USERNAME, logger
 from database import work_session_maker
 from models import Employer, Vacancy, WorkUser
 from keyboards import student_main_menu_kb, employer_main_menu_kb, open_feed_kb, student_vacancy_card_kb
-from services.availability import find_student, forget_student
+from services.availability import FACULTY_SHORT, find_students, forget_student
 from services.shift_format import is_upcoming
 
 router = Router()
@@ -76,19 +76,21 @@ async def cmd_start(message: Message, command: CommandObject):
 
     # 3. Проверка наличия расписания в базах факультетов (Биофак, ФСК)
     forget_student(user_id)
-    is_synced = (await find_student(user_id)) is not None
+    refs = await find_students(user_id)
+    is_synced = bool(refs)
+    where = ", ".join(FACULTY_SHORT.get(r.faculty, r.faculty) for r in refs)
 
     # 4. Формирование подсказки о синхронизации с учебой
     if is_synced:
         sync_badge = (
-            "🟢 <b>Расписание БГУ подключено:</b>\n"
+            f"🟢 <b>Расписание БГУ подключено ({where}):</b>\n"
             "Бот знает ваши пары на факультете и будет присылать только те смены, "
             "которые подходят под ваши свободные часы (с учетом дороги)"
         )
     else:
         sync_badge = (
             "💡 <b>Подсказка:</b>\n"
-            "Вы пока не выбрали группу в ботах расписания (AvesBio / AvesFlow) "
+            "Вы пока не выбрали группу в ботах расписания (AvesBio / AvesFlow / AvesGlobe) "
             "Запустите их, чтобы AvesWork автоматически видел сетку ваших занятий"
         )
 

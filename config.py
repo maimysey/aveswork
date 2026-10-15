@@ -41,6 +41,9 @@ BIO_DB_URL = _ensure_asyncpg_driver(os.getenv("BIO_DB_URL", ""))
 # 3. База ФСК (Read-Only)
 FSK_DB_URL = _ensure_asyncpg_driver(os.getenv("FSK_DB_URL", ""))
 
+# 4. База ФМО / AvesGlobe (Read-Only). Не задана — ФМО в подборе не участвует
+FMO_DB_URL = _ensure_asyncpg_driver(os.getenv("FMO_DB_URL", ""))
+
 # SSL к Supabase. Для локальных тестов без SSL: DB_SSL=disable
 DB_SSL = os.getenv("DB_SSL", "require").strip().lower()
 
@@ -77,7 +80,7 @@ WORK_WEB_ACCESS = "testers" if os.getenv("WORK_WEB_ACCESS", "all").strip().lower
 # Боты, через которых уходят короткие уведомления: код факультета → адрес сервиса бота
 WORK_RELAY_BOTS: dict[str, str] = {}
 for _pair in os.getenv(
-    "WORK_RELAY_BOTS", "bio=https://biobotm.onrender.com,fsk=https://mambafsk.onrender.com"
+    "WORK_RELAY_BOTS", "bio=https://biobotm.onrender.com,fsk=https://mambafsk.onrender.com,fmo=https://mambafmo.onrender.com"
 ).split(","):
     if "=" in _pair:
         _code, _url = _pair.split("=", 1)

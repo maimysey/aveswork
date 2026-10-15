@@ -4,7 +4,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import MenuButtonWebApp, WebAppInfo
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import BOT_TOKEN, WORK_MODE, logger
@@ -12,7 +11,6 @@ from database import migrate_work_schema, dispose_all_engines
 from models import WorkBase
 from middlewares.metrics_middleware import MetricsMiddleware
 from handlers import admin, employer, student, settings, start
-from keyboards import FEED_WEBAPP_URL
 from services.relay import relay_worker, setup_relay_routes
 from services.webapp_work_api import setup_work_api
 
@@ -46,15 +44,7 @@ async def on_startup(bot: Bot):
     )
     logger.info("🚀 Вебхук установлен. Сервис готов принимать смены и отклики!")
 
-    # 3. Кнопка «Смены» слева от поля ввода — лента на сайте внутри Telegram
-    try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="Смены", web_app=WebAppInfo(url=FEED_WEBAPP_URL))
-        )
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось установить кнопку ленты: {e}")
-
-    # 4. Очередь коротких уведомлений через ботов факультетов
+    # 3. Очередь коротких уведомлений через ботов факультетов
     background_tasks.append(asyncio.create_task(relay_worker()))
     logger.info(f"💼 Раздел «Смены» работает в режиме: {WORK_MODE}")
 

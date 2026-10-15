@@ -3,15 +3,15 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    WebAppInfo,
 )
 from config import AVES_SITE_URL
 from models import UserBusySlot, Vacancy
 
 DAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-# Лента смен на сайте внутри Telegram (вход по initData этого бота)
-FEED_WEBAPP_URL = f"{AVES_SITE_URL}/app/?via=work&tab=work"
+# Лента смен на сайте. Обычная ссылка: вход через Telegram на сайте один раз,
+# дальше сайт помнит. (Mini App открывается из коротких уведомлений ботов расписания.)
+FEED_URL = f"{AVES_SITE_URL}/app/?tab=work"
 
 
 # ==================== КЛАВИАТУРЫ ГЛАВНОГО МЕНЮ ====================
@@ -39,7 +39,7 @@ def employer_main_menu_kb() -> ReplyKeyboardMarkup:
 def open_feed_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="📋 Все смены под моё расписание", web_app=WebAppInfo(url=FEED_WEBAPP_URL))
+            InlineKeyboardButton(text="📋 Все смены под моё расписание", url=FEED_URL)
         ]]
     )
 
@@ -91,7 +91,7 @@ def student_settings_kb(is_active: bool, notifications_enabled: bool) -> InlineK
             [InlineKeyboardButton(text=search_label, callback_data="toggle_search_status")],
             [InlineKeyboardButton(text=notif_label, callback_data="toggle_notif_status")],
             [InlineKeyboardButton(text="⏳ Настроить занятые часы", callback_data="add_busy_slot")],
-            [InlineKeyboardButton(text="📋 Лента смен", web_app=WebAppInfo(url=FEED_WEBAPP_URL))],
+            [InlineKeyboardButton(text="📋 Лента смен на сайте", url=FEED_URL)],
         ]
     )
 

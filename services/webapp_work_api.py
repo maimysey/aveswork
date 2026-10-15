@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import time as _clock
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -36,17 +37,17 @@ from database import FACULTY_SESSIONS, work_session_maker
 from models import Employer, UserBusySlot, Vacancy, VacancyDelivery, WorkPref, WorkUser
 from services.applications import apply_to_shift, withdraw_application
 from services.availability import (
+    FACULTY_BOT,
+    FACULTY_SHORT,
     StudentRef,
-    find_student,
-    get_conflicting_slots,
-    grid,
+    combined_schedule,
+    find_students,
     group_label,
-    hhmm,
-    student_schedule,
+    m2s,
+    overlaps,
     to_min,
 )
-from services.matcher import relay_allowed_for
-from services.relay import get_relay_pref, set_relay_pref
+from services.matcher import considered_faculties, relay_allowed_for, relay_channel, split_off
 from services.shift_format import is_upcoming, pay_text, shift_hours
 from services.shift_meta import CATEGORY_TITLES, detect_place
 
@@ -173,8 +174,28 @@ async def work_auth(request: web.Request, handler: Handler) -> web.StreamRespons
 
 # ───────────────────────── помощники ─────────────────────────
 
-async def _student(request: web.Request) -> StudentRef | None:
-    return await find_student(_uid(request), request.query.get("f") or None)
+@dataclass
+class Who:
+    """Кто смотрит раздел: все его расписания, учитываемые расписания и настройки."""
+    uid: int
+    refs: list[StudentRef]          # все боты расписания, где выбрана группа
+    used: list[StudentRef]          # те, что учитываем (без выключенных)
+    primary: StudentRef | None      # для имени и @username в отклике
+    pref: WorkPref | None
+    off: set[str]
+
+
+async def _whoami(request: web.Request) -> Who:
+    uid = _uid(request)
+    refs = await find_students(uid)
+    async with work_session_maker() as session:
+        pref = await session.get(WorkPref, uid)
+    off = split_off(pref.schedules_off if pref else "")
+    allowed = set(considered_faculties({r.faculty: r for r in refs}, off))
+    used = [r for r in refs if r.faculty in allowed]
+    prefer = request.query.get("f") or None
+    primary = next((r for r in refs if r.faculty == prefer), refs[0] if refs else None)
+    return Who(uid=uid, refs=refs, used=used, primary=primary, pref=pref, off=off)
 
 
 def _t(v: time) -> str:
@@ -187,11 +208,6 @@ def _parse_hhmm(raw: Any) -> time | None:
         return time(int(h), int(m))
     except Exception:
         return None
-
-
-def _slot_label(faculty: str, slot: int) -> str:
-    a, b = grid(faculty)[slot]
-    return f"{slot} пара, {hhmm(a)}–{hhmm(b)}"
 
 
 def _group_busy(rows: list[UserBusySlot]) -> list[dict]:
@@ -214,8 +230,7 @@ def _free_windows(busy: list[tuple[int, int]]) -> list[dict]:
         cur = max(cur, e)
     if DAY_TO - cur >= MIN_WINDOW:
         out.append((cur, DAY_TO))
-    return [{"start": f"{a // 60:02d}:{a % 60:02d}", "end": f"{b // 60:02d}:{b % 60:02d}"}
-            for a, b in out if b > a]
+    return [{"start": m2s(a), "end": m2s(b)} for a, b in out if b > a]
 
 
 async def _bot_username(request: web.Request) -> str | None:
@@ -252,8 +267,8 @@ async def api_auth_webapp(request: web.Request) -> web.Response:
 # ───────────────────────── профиль ─────────────────────────
 
 async def api_me(request: web.Request) -> web.Response:
-    uid = _uid(request)
-    ref = await _student(request)
+    who = await _whoami(request)
+    uid = who.uid
     async with work_session_maker() as session:
         wu = await session.get(WorkUser, uid)
         busy = (await session.execute(
@@ -265,7 +280,19 @@ async def api_me(request: web.Request) -> web.Response:
             .where(VacancyDelivery.status == "applied")
         ) or 0
         is_employer = bool(await session.get(Employer, uid))
-    relay_enabled = await get_relay_pref(uid)
+
+    by_fac = {r.faculty: r for r in who.refs}
+    channel = relay_channel(by_fac, who.pref.relay_faculty if who.pref else None)
+    schedules = []
+    for r in who.refs:
+        schedules.append({
+            "faculty": r.faculty,
+            "title": FACULTY_SHORT.get(r.faculty, r.faculty),
+            "bot": FACULTY_BOT.get(r.faculty, r.faculty),
+            "group": await group_label(r),
+            "used": r.faculty not in who.off,
+            "relay": r.faculty in WORK_RELAY_BOTS,
+        })
 
     return ok({
         "mode": WORK_MODE,
@@ -273,16 +300,18 @@ async def api_me(request: web.Request) -> web.Response:
         "bot": await _bot_username(request),
         "employer": is_employer,
         "student": {
-            "faculty": ref.faculty,
-            "group": await group_label(ref),
-            "subgroup": ref.subgroup or 0,
-        } if ref else None,
+            "faculty": who.primary.faculty,
+            "group": await group_label(who.primary),
+            "subgroup": who.primary.subgroup or 0,
+        } if who.primary else None,
+        "schedules": schedules,
         "settings": {
             "search_active": wu.is_active if wu else True,
             "bot_connected": bool(wu and wu.bot_started),
             "bot_notifications": wu.notifications_enabled if wu else True,
-            "relay_enabled": relay_enabled,
-            "relay_available": bool(ref and ref.faculty in WORK_RELAY_BOTS and relay_allowed_for(uid)),
+            "relay_enabled": who.pref.relay_enabled if who.pref else True,
+            "relay_available": bool(channel and relay_allowed_for(uid)),
+            "relay_faculty": channel,
         },
         "busy": _group_busy(list(busy)),
         "stats": {"applied": applied},
@@ -302,8 +331,26 @@ async def _ensure_work_user(session, uid: int) -> WorkUser:
 async def api_me_update(request: web.Request) -> web.Response:
     uid = _uid(request)
     body = await request.json()
-    if "relay_enabled" in body:
-        await set_relay_pref(uid, bool(body["relay_enabled"]))
+
+    if any(k in body for k in ("relay_enabled", "schedules_off", "relay_faculty")):
+        refs = {r.faculty for r in await find_students(uid)}
+        async with work_session_maker() as session:
+            pref = await session.get(WorkPref, uid)
+            if not pref:
+                pref = WorkPref(telegram_id=uid, relay_enabled=True, schedules_off="")
+                session.add(pref)
+            if "relay_enabled" in body:
+                pref.relay_enabled = bool(body["relay_enabled"])
+            if "schedules_off" in body:
+                off = {str(f) for f in (body["schedules_off"] or []) if str(f) in refs}
+                pref.schedules_off = ",".join(sorted(off))
+            if "relay_faculty" in body:
+                fac = body["relay_faculty"]
+                if fac is not None and (fac not in refs or fac not in WORK_RELAY_BOTS):
+                    return fail(400, "bad_faculty", "Через этого бота присылать нельзя.")
+                pref.relay_faculty = fac
+            await session.commit()
+
     if "search_active" in body or "bot_notifications" in body:
         async with work_session_maker() as session:
             wu = await _ensure_work_user(session, uid)
@@ -376,10 +423,10 @@ def _vacancy_json(v: Vacancy, company: str, batch: list[Vacancy], now: datetime)
 
 
 async def api_feed(request: web.Request) -> web.Response:
-    uid = _uid(request)
+    who = await _whoami(request)
+    uid = who.uid
     now = get_minsk_now()
     today = now.date()
-    ref = await _student(request)
     tester = is_tester(uid)
 
     async with work_session_maker() as session:
@@ -413,13 +460,12 @@ async def api_feed(request: web.Request) -> web.Response:
 
     days = [today + timedelta(days=i) for i in range(7)]
     dates_needed = sorted({v.target_date for v in vacs} | set(days))
-    schedule = await student_schedule(ref, dates_needed) if ref else {}
+    # Все учитываемые расписания сразу: человек в двух ботах свободен, только если свободен в обоих
+    schedule = await combined_schedule(who.used, dates_needed) if who.used else {}
 
     def lesson_conflict(v: Vacancy) -> str | None:
-        if not ref:
-            return None
-        clash = sorted(set(schedule.get(v.target_date, [])) & get_conflicting_slots(ref.faculty, v.start_time, v.end_time))
-        return _slot_label(ref.faculty, clash[0]) if clash else None
+        b = overlaps(schedule.get(v.target_date, []), v.start_time, v.end_time)
+        return b[2] if b else None
 
     def personal_conflict(v: Vacancy) -> str | None:
         for b in personal:
@@ -457,15 +503,13 @@ async def api_feed(request: web.Request) -> web.Response:
 
     week = []
     for d in days:
-        lessons = [] if not ref else [
-            {"slot": s, "start": hhmm(grid(ref.faculty)[s][0]), "end": hhmm(grid(ref.faculty)[s][1])}
-            for s in schedule.get(d, []) if s in grid(ref.faculty)
-        ]
+        lessons = [{"start": m2s(s), "end": m2s(e), "label": label} for s, e, label in schedule.get(d, [])]
         busy = [
             {"start": _t(b.start_time), "end": _t(b.end_time), "title": b.title}
             for b in personal if b.day_of_week == d.weekday()
         ]
-        blocks = [(to_min(_parse_hhmm(x["start"])), to_min(_parse_hhmm(x["end"]))) for x in lessons + busy]
+        blocks = [(s, e) for s, e, _ in schedule.get(d, [])]
+        blocks += [(to_min(b.start_time), to_min(b.end_time)) for b in personal if b.day_of_week == d.weekday()]
         if d == today:
             blocks.append((DAY_FROM, max(DAY_FROM, now.hour * 60 + now.minute)))
         week.append({"date": d.isoformat(), "lessons": lessons, "busy": busy, "free": _free_windows(blocks)})
@@ -474,7 +518,8 @@ async def api_feed(request: web.Request) -> web.Response:
         "mode": WORK_MODE,
         "today": today.isoformat(),
         "now": now.strftime("%H:%M"),
-        "has_schedule": ref is not None,
+        "has_schedule": bool(who.used),
+        "schedules_used": [FACULTY_SHORT.get(r.faculty, r.faculty) for r in who.used],
         "search_active": wu.is_active if wu else True,
         "week": week,
         "items": items,
@@ -491,9 +536,10 @@ _APPLY_ERRORS = {
 
 
 async def _who(request: web.Request) -> tuple[str | None, str | None]:
-    ref = await _student(request)
-    name = (ref.name if ref else None) or request["aves_user"].get("name")
-    return name, (ref.username if ref else None)
+    refs = await find_students(_uid(request))
+    name = next((r.name for r in refs if r.name), None) or request["aves_user"].get("name")
+    username = next((r.username for r in refs if r.username), None)
+    return name, username
 
 
 async def api_apply(request: web.Request) -> web.Response:

@@ -12,6 +12,7 @@ from sqlalchemy import (
     func,
     Index,
     UniqueConstraint,
+    JSON,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -25,6 +26,11 @@ class WorkBase(DeclarativeBase):
 
 
 class FacultyBase(DeclarativeBase):
+    pass
+
+
+class FmoBase(DeclarativeBase):
+    """Зеркала базы ФМО (AvesGlobe): у пар точное время, языковые подгруппы и ДВС."""
     pass
 
 
@@ -139,6 +145,10 @@ class WorkPref(WorkBase):
 
     telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     relay_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Человек в нескольких ботах расписания: какие расписания НЕ учитывать (через запятую: "fmo")
+    schedules_off: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Через какого бота присылать короткие уведомления (bio / fsk / fmo); пусто — первый по порядку
+    relay_faculty: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
@@ -203,3 +213,29 @@ class FacultyGroup(FacultyBase):
     course: Mapped[int] = mapped_column(SmallInteger)
     number: Mapped[str] = mapped_column(String)
     study_mode: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class FmoUser(FmoBase):
+    __tablename__ = "users"
+
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tracks: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    choices: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    notifications_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+
+class FmoLesson(FmoBase):
+    __tablename__ = "lessons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(Integer)
+    week_id: Mapped[int] = mapped_column(Integer)
+    day: Mapped[int] = mapped_column(SmallInteger)
+    time_start: Mapped[str] = mapped_column(String(5))
+    time_end: Mapped[str] = mapped_column(String(5))
+    track: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    label_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    choice_key: Mapped[str | None] = mapped_column(String(64), nullable=True)

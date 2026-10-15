@@ -15,8 +15,9 @@ from config import (
     RELAY_MAX_PER_DAY, RELAY_MAX_PER_WEEK, QUIET_FROM, QUIET_TO, get_minsk_now, logger,
 )
 from database import work_session_maker
-from models import Employer, WorkUser, Vacancy, VacancyDelivery, UserBusySlot, RelayOutbox
-from services.availability import find_student, forget_student
+from models import Employer, WorkUser, Vacancy, VacancyDelivery, UserBusySlot, RelayOutbox, WorkPref
+from services.availability import find_students, forget_student
+from services.matcher import relay_channel
 from services.metrics import metrics_service
 from services.relay import queue_stats
 from services.shift_meta import describe
@@ -299,12 +300,15 @@ async def cmd_demo_clear(message: Message):
 async def cmd_relay_test(message: Message):
     uid = message.from_user.id
     forget_student(uid)
-    ref = await find_student(uid)
-    if not ref:
+    refs = await find_students(uid)
+    if not refs:
         await message.answer("⚠️ Вы не выбрали группу ни в одном боте расписания — короткое уведомление некуда отправить.")
         return
-    if ref.faculty not in WORK_RELAY_BOTS:
-        await message.answer(f"⚠️ Для факультета <b>{ref.faculty}</b> не задан бот в WORK_RELAY_BOTS.")
+    async with work_session_maker() as session:
+        pref = await session.get(WorkPref, uid)
+    faculty = relay_channel({r.faculty: r for r in refs}, pref.relay_faculty if pref else None)
+    if not faculty:
+        await message.answer("⚠️ Для ваших факультетов не задан бот в WORK_RELAY_BOTS.")
         return
 
     async with work_session_maker() as session:
@@ -321,7 +325,7 @@ async def cmd_relay_test(message: Message):
         now = get_minsk_now()
         await session.execute(
             pg_insert(RelayOutbox).values(
-                user_id=uid, faculty=ref.faculty, vacancy_id=vac.id, status="pending",
+                user_id=uid, faculty=faculty, vacancy_id=vac.id, status="pending",
                 attempts=0, not_before=now, created_at=now,
             ).on_conflict_do_update(
                 constraint="uq_relay_user_vacancy",
@@ -330,7 +334,7 @@ async def cmd_relay_test(message: Message):
         )
         await session.commit()
     await message.answer(
-        f"📨 Поставлено в очередь: смена #{vac.id} → бот факультета <b>{ref.faculty}</b>.\n"
+        f"📨 Поставлено в очередь: смена #{vac.id} → бот факультета <b>{faculty}</b>.\n"
         "Придёт в течение ~20 секунд (если бот факультета спит — до минуты). Статус: /work"
     )
 

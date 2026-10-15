@@ -1,6 +1,6 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from config import WORK_DB_URL, BIO_DB_URL, FSK_DB_URL, DB_SSL, logger
+from config import WORK_DB_URL, BIO_DB_URL, FSK_DB_URL, FMO_DB_URL, DB_SSL, logger
 
 _CONNECT_ARGS = {} if DB_SSL == "disable" else {"ssl": "require"}
 
@@ -60,11 +60,30 @@ fsk_session_maker = async_sessionmaker(
     expire_on_commit=False,
 )
 
-# ==================== РЕЕСТР ФАКУЛЬТЕТСКИХ БАЗ (на будующее) ====================\
+# ==================== 4. БАЗА ФМО / AvesGlobe (READ-ONLY, если задана) ====================
+fmo_engine = None
+fmo_session_maker = None
+if FMO_DB_URL:
+    fmo_engine = create_async_engine(
+        FMO_DB_URL,
+        echo=False,
+        connect_args=_CONNECT_ARGS,
+        pool_size=2,
+        max_overflow=5,
+        pool_timeout=15,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        execution_options={"isolation_level": "AUTOCOMMIT"},
+    )
+    fmo_session_maker = async_sessionmaker(fmo_engine, class_=AsyncSession, expire_on_commit=False)
+
+# ==================== РЕЕСТР ФАКУЛЬТЕТСКИХ БАЗ ====================
 FACULTY_SESSIONS: dict[str, async_sessionmaker[AsyncSession]] = {
     "bio": bio_session_maker,
     "fsk": fsk_session_maker,
 }
+if fmo_session_maker:
+    FACULTY_SESSIONS["fmo"] = fmo_session_maker
 
 
 # ==================== МИГРАЦИИ ====================
@@ -82,6 +101,8 @@ _MIGRATIONS = [
     "ALTER TABLE vacancies ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
     "CREATE INDEX IF NOT EXISTS ix_vacancies_status ON vacancies (status)",
     "CREATE INDEX IF NOT EXISTS ix_vacancies_batch_key ON vacancies (batch_key)",
+    "ALTER TABLE work_prefs ADD COLUMN IF NOT EXISTS schedules_off VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE work_prefs ADD COLUMN IF NOT EXISTS relay_faculty VARCHAR(16)",
 ]
 
 
@@ -98,4 +119,6 @@ async def dispose_all_engines() -> None:
     await work_engine.dispose()
     await bio_engine.dispose()
     await fsk_engine.dispose()
+    if fmo_engine:
+        await fmo_engine.dispose()
     logger.info("✅ Все пулы Supabase успешно закрыты")
