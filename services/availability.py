@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time as _clock
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -224,7 +225,9 @@ async def _lesson_rows(session, faculty: str, weeks: dict[int, int], days: set[i
         return []
     if faculty in EXACT_TIME_FACULTIES:
         L = FmoLesson
-        q = select(L.group_id, L.week_id, L.day, L.time_start, L.time_end, L.track, L.label_key, L.choice_key)
+        q = select(L.group_id, L.week_id, L.day, L.time_start, L.time_end, L.track, L.label_key, L.choice_key,
+                   L.subject, L.label)
+        days = None  # ДВС-альтернативы стоят в разные дни — ФМО берём всю неделю, день отбираем потом
     else:
         L = FacultyLesson
         q = select(L.group_id, L.week_id, L.day, L.subgroup, L.slot_id)
@@ -241,29 +244,46 @@ async def _lesson_rows(session, faculty: str, weeks: dict[int, int], days: set[i
 Block = tuple[int, int, str]   # (начало, конец в минутах, подпись)
 
 
-def student_blocks(ref: StudentRef, rows: list) -> list[Block]:
-    """Пары одного дня одной группы → интервалы, которые действительно заняты у студента."""
+def student_blocks(ref: StudentRef, rows: list, week_rows: list | None = None) -> list[Block]:
+    """Пары одного дня одной группы → интервалы, которые действительно заняты у студента.
+    week_rows — вся неделя группы (нужна ФМО: наборы ДВС)."""
     if ref.faculty in EXACT_TIME_FACULTIES:
-        return _fmo_blocks(ref, rows)
+        return _fmo_blocks(ref, rows, week_rows if week_rows is not None else rows)
     g = grid(ref.faculty)
     slots = blocking_slots(ref.subgroup, [(r[3], r[4]) for r in rows])
     return [(to_min(g[s][0]), to_min(g[s][1]), f"{s} пара, {hhmm(g[s][0])}–{hhmm(g[s][1])}") for s in slots if s in g]
 
 
-def _fmo_blocks(ref: StudentRef, rows: list) -> list[Block]:
-    """Логика как в боте ФМО (filter_for_user), но с перестраховкой:
-       • пара без подгруппы — общая;
-       • языковая — если её подгруппа выбрана в этом треке; трек не настроен — считаем занятым;
-       • ДВС — если выбрана она или не выбрана ни одна из альтернатив в это же время."""
-    picked = set(ref.choices or [])
-    chosen_at: set[tuple[int, str]] = {(r[2], str(r[3])) for r in rows if r[7] and r[7] in picked}
+def subject_key(subject: str | None) -> str:
+    return re.sub(r"\s+", " ", (subject or "").strip().lower())
+
+
+def _fmo_blocks(ref: StudentRef, rows: list, week_rows: list) -> list[Block]:
+    """Повторяет filter_for_user из бота ФМО (fmo_db/materialize.py):
+       • пара без метки — общая;
+       • языковая видна, если её ключ выбран в этом треке; трек не настроен — видны все варианты
+         (кроме меток трека «lang»/без трека, которых нет среди выбранных);
+       • ДВС: если студент выбрал предмет из набора альтернатив — только он.
+    Строка: (group_id, week_id, day, time_start, time_end, track, label_key, choice_key, subject, label)."""
+    tracks = ref.tracks or {}
+    chosen = {subject_key(c) for c in (ref.choices or [])}
+    all_keys = {k for keys in tracks.values() for k in (keys or [])}
+    by_choice: dict[str, set[str]] = defaultdict(set)
+    for r in week_rows:
+        if r[7]:
+            by_choice[r[7]].add(subject_key(r[8]))
+
     out: list[Block] = []
-    for gid, wid, day, ts, te, track, label_key, choice_key in rows:
-        if track and label_key:
-            mine = (ref.tracks or {}).get(track)
-            if mine and label_key not in mine:
+    for gid, wid, day, ts, te, track, label_key, choice_key, subject, label in rows:
+        key = label_key or label
+        if key:
+            mine = tracks.get(track) if track in tracks else None
+            if mine is not None:
+                if key not in mine:
+                    continue
+            elif all_keys and track in ("lang", None) and key not in all_keys:
                 continue
-        if choice_key and picked and choice_key not in picked and (day, str(ts)) in chosen_at:
+        if choice_key and chosen & by_choice[choice_key] and subject_key(subject) not in chosen:
             continue
         s, e = _parse_min(ts), _parse_min(te)
         if s is None:
@@ -301,15 +321,19 @@ async def free_students(faculty: str, target: date, start: time, end: time) -> t
         return {}, set()
 
     by_group: dict[int, list] = defaultdict(list)
+    week_of_group: dict[int, list] = defaultdict(list)
     for r in rows:
-        by_group[r[0]].append(r)
+        week_of_group[r[0]].append(r)
+        if r[2] == target.weekday():
+            by_group[r[0]].append(r)
 
     registered: dict[int, StudentRef] = {}
     free: set[int] = set()
     for row in users:
         ref = _ref(faculty, row)
         registered[ref.uid] = ref
-        if not overlaps(student_blocks(ref, by_group.get(ref.group_id, [])), start, end):
+        blocks = student_blocks(ref, by_group.get(ref.group_id, []), week_of_group.get(ref.group_id, []))
+        if not overlaps(blocks, start, end):
             free.add(ref.uid)
     return registered, free
 
@@ -392,10 +416,13 @@ async def student_schedule(ref: StudentRef, dates: list[date]) -> dict[date, lis
         return {d: [] for d in dates}
 
     by_week_day: dict[tuple[int, int], list] = defaultdict(list)
+    by_week: dict[int, list] = defaultdict(list)
     for r in rows:
         by_week_day[(r[1], r[2])].append(r)
+        by_week[r[1]].append(r)
     return {
-        d: student_blocks(ref, by_week_day.get((week_for[d], d.weekday()), [])) if week_for[d] is not None else []
+        d: student_blocks(ref, by_week_day.get((week_for[d], d.weekday()), []), by_week.get(week_for[d], []))
+        if week_for[d] is not None else []
         for d in dates
     }
 

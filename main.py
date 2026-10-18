@@ -13,6 +13,7 @@ from middlewares.metrics_middleware import MetricsMiddleware
 from handlers import admin, employer, student, settings, start
 from services.relay import relay_worker, setup_relay_routes
 from services.webapp_work_api import setup_work_api
+from services.reminders import setup_reminders
 
 # Настройки Webhook и сервера
 WEBHOOK_PATH = "/webhook"
@@ -97,6 +98,18 @@ def main():
     # Раздел «Смены» на сайте (/api/work/*) и связка с ботами факультетов (/internal/*)
     setup_work_api(app, bot)
     setup_relay_routes(app)
+
+    # Напоминания текстом и справка по «помощь» (как во всех ботах Aves)
+    from database import work_session_maker
+    from handlers.settings import HELP_TEXT
+    from keyboards import business_contact_kb
+    from config import OWNER_USERNAME
+    setup_reminders(
+        app, dp, bot, work_session_maker, bot_code="work", help_text=lambda m: HELP_TEXT,
+        help_markup=business_contact_kb(OWNER_USERNAME), web_api=False,
+        help_extra="🕒 <b>Мои часы</b> — в мини-аппе: «Смены» → «Мои часы». Свободное время недели с учётом пар, "
+                   "взятых смен и ваших занятых часов, там же можно поставить напоминание\n\n",
+    )
 
     # Обработчик вебхуков
     webhook_handler = SimpleRequestHandler(

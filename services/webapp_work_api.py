@@ -218,7 +218,8 @@ def _group_busy(rows: list[UserBusySlot]) -> list[dict]:
         item = merged.setdefault(key, {"ids": [], "days": [], "start": _t(r.start_time),
                                        "end": _t(r.end_time), "title": r.title})
         item["ids"].append(r.id)
-        item["days"].append(r.day_of_week)
+        if r.day_of_week not in item["days"]:
+            item["days"].append(r.day_of_week)
     return sorted(merged.values(), key=lambda x: (min(x["days"]), x["start"]))
 
 
@@ -377,8 +378,13 @@ async def api_busy_add(request: web.Request) -> web.Response:
         count = await session.scalar(select(func.count(UserBusySlot.id)).where(UserBusySlot.user_id == uid)) or 0
         if count + len(days) > 60:
             return fail(400, "too_many", "Слишком много интервалов. Удалите старые.")
+        same = set((await session.execute(
+            select(UserBusySlot.day_of_week).where(UserBusySlot.user_id == uid, UserBusySlot.start_time == start,
+                                                   UserBusySlot.end_time == end, UserBusySlot.title == title)
+        )).scalars().all())
         for d in days:
-            session.add(UserBusySlot(user_id=uid, day_of_week=d, start_time=start, end_time=end, title=title))
+            if d not in same:   # повторное «Добавить» не плодит дубли
+                session.add(UserBusySlot(user_id=uid, day_of_week=d, start_time=start, end_time=end, title=title))
         await session.commit()
     return await api_me(request)
 
@@ -473,10 +479,24 @@ async def api_feed(request: web.Request) -> web.Response:
                 return f"{b.title}, {_t(b.start_time)}–{_t(b.end_time)}"
         return None
 
+    taken = [v for v in vacs if my.get(v.id) == "applied"]
+
+    def shift_conflict(v: Vacancy) -> str | None:
+        # уже взятая смена в то же время (другая публикация)
+        for t in taken:
+            if t.id == v.id or (v.batch_key and t.batch_key == v.batch_key):
+                continue
+            if t.target_date == v.target_date and t.start_time < v.end_time and t.end_time > v.start_time:
+                return f"{t.title or 'Смена'}, {_t(t.start_time)}–{_t(t.end_time)}"
+        return None
+
     def conflict_of(v: Vacancy) -> dict | None:
         c = lesson_conflict(v)
         if c:
             return {"kind": "lesson", "label": c}
+        c = shift_conflict(v)
+        if c:
+            return {"kind": "shift", "label": c}
         c = personal_conflict(v)
         return {"kind": "personal", "label": c} if c else None
 
@@ -508,11 +528,15 @@ async def api_feed(request: web.Request) -> web.Response:
             {"start": _t(b.start_time), "end": _t(b.end_time), "title": b.title}
             for b in personal if b.day_of_week == d.weekday()
         ]
+        shifts = [{"id": t.id, "start": _t(t.start_time), "end": _t(t.end_time), "title": t.title or "Смена"}
+                  for t in taken if t.target_date == d]
         blocks = [(s, e) for s, e, _ in schedule.get(d, [])]
         blocks += [(to_min(b.start_time), to_min(b.end_time)) for b in personal if b.day_of_week == d.weekday()]
+        blocks += [(to_min(t.start_time), to_min(t.end_time)) for t in taken if t.target_date == d]
         if d == today:
             blocks.append((DAY_FROM, max(DAY_FROM, now.hour * 60 + now.minute)))
-        week.append({"date": d.isoformat(), "lessons": lessons, "busy": busy, "free": _free_windows(blocks)})
+        week.append({"date": d.isoformat(), "lessons": lessons, "busy": busy, "shifts": shifts,
+                     "free": _free_windows(blocks)})
 
     return ok({
         "mode": WORK_MODE,
@@ -523,6 +547,134 @@ async def api_feed(request: web.Request) -> web.Response:
         "search_active": wu.is_active if wu else True,
         "week": week,
         "items": items,
+    })
+
+
+# ───────────────────────── «Мои часы» ─────────────────────────
+
+HOURS_MIN_GAP = 30   # свободным считаем окно от 30 минут: перемены между парами — не время
+
+
+def _union(iv: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(x for x in iv if x[1] > x[0]):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _clip(iv: list[tuple[int, int]], lo: int, hi: int) -> list[tuple[int, int]]:
+    return [(max(a, lo), min(b, hi)) for a, b in iv if min(b, hi) > max(a, lo)]
+
+
+def _total(iv: list[tuple[int, int]]) -> int:
+    return sum(b - a for a, b in _union(iv))
+
+
+def _hours_bounds(request: web.Request) -> tuple[int, int]:
+    raw_to = (request.query.get("to") or "").strip()
+    lo, hi = _parse_hhmm(request.query.get("from")), _parse_hhmm(raw_to)
+    lo_m = to_min(lo) if lo else DAY_FROM
+    hi_m = 24 * 60 if raw_to in ("24:00", "00:00") else (to_min(hi) if hi else DAY_TO)
+    if not (0 <= lo_m < hi_m <= 24 * 60) or hi_m - lo_m < 4 * 60:
+        return DAY_FROM, DAY_TO
+    return lo_m, hi_m
+
+
+async def api_hours(request: web.Request) -> web.Response:
+    """Свободные часы недели: пары (все учитываемые расписания), взятые смены и личные занятые часы."""
+    who = await _whoami(request)
+    uid = who.uid
+    now = get_minsk_now()
+    today = now.date()
+    now_min = now.hour * 60 + now.minute
+    try:
+        offset = max(-1, min(4, int(request.query.get("week", "0"))))
+    except ValueError:
+        offset = 0
+    lo, hi = _hours_bounds(request)
+    monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+    days = [monday + timedelta(days=i) for i in range(7)]
+
+    async with work_session_maker() as session:
+        personal = (await session.execute(
+            select(UserBusySlot).where(UserBusySlot.user_id == uid)
+        )).scalars().all()
+        taken_rows = (await session.execute(
+            select(Vacancy, Employer.company_name)
+            .join(VacancyDelivery, VacancyDelivery.vacancy_id == Vacancy.id)
+            .join(Employer, Employer.telegram_id == Vacancy.employer_id, isouter=True)
+            .where(VacancyDelivery.user_id == uid)
+            .where(VacancyDelivery.status == "applied")
+            .where(Vacancy.status.in_(("active", "closed")))
+            .where(Vacancy.target_date >= days[0])
+            .where(Vacancy.target_date <= days[-1])
+            .order_by(Vacancy.target_date, Vacancy.start_time)
+        )).all()
+        wu = await session.get(WorkUser, uid)
+
+    schedule = await combined_schedule(who.used, days) if who.used else {}
+
+    out_days = []
+    tot = {"free": 0, "free_left": 0, "study": 0, "shifts": 0, "busy": 0}
+    for d in days:
+        study = [(s, e) for s, e, _ in schedule.get(d, [])]
+        shifts = [(v, comp) for v, comp in taken_rows if v.target_date == d]
+        shift_iv = [(to_min(v.start_time), to_min(v.end_time)) for v, _ in shifts]
+        mine = [b for b in personal if b.day_of_week == d.weekday()]
+        busy_iv = [(to_min(b.start_time), to_min(b.end_time)) for b in mine]
+
+        occupied = _union(_clip(study + shift_iv + busy_iv, lo, hi))
+        windows, cur = [], lo
+        for a, b in occupied + [(hi, hi)]:
+            if a - cur >= HOURS_MIN_GAP:
+                windows.append((cur, a))
+            cur = max(cur, b)
+
+        past_until = hi if d < today else (now_min if d == today else lo)
+        win_json, free, free_left = [], 0, 0
+        for a, b in windows:
+            free += b - a
+            left = max(0, b - max(a, past_until))
+            if left >= HOURS_MIN_GAP:
+                free_left += left
+            win_json.append({"start": m2s(a), "end": m2s(b), "minutes": b - a,
+                             "past": b <= past_until, "now": a < past_until < b})
+        day = {
+            "date": d.isoformat(),
+            "weekday": d.weekday(),
+            "is_today": d == today,
+            "is_past": d < today,
+            "lessons": [{"start": m2s(s), "end": m2s(e), "label": label} for s, e, label in schedule.get(d, [])],
+            "shifts": [{"id": v.id, "start": _t(v.start_time), "end": _t(v.end_time), "title": v.title or "Смена",
+                        "company": comp or "", "place": detect_place(v.raw_text), "closed": v.status != "active"}
+                       for v, comp in shifts],
+            "busy": [{"id": b.id, "start": _t(b.start_time), "end": _t(b.end_time), "title": b.title} for b in mine],
+            "free": win_json,
+            "minutes": {"free": free, "free_left": free_left,
+                        "study": _total(_clip(study, lo, hi)), "shifts": _total(_clip(shift_iv, lo, hi)),
+                        "busy": _total(_clip(busy_iv, lo, hi))},
+        }
+        for k in tot:
+            tot[k] += day["minutes"][k]
+        out_days.append(day)
+
+    return ok({
+        "today": today.isoformat(),
+        "now": now.strftime("%H:%M"),
+        "week": offset,
+        "monday": days[0].isoformat(),
+        "sunday": days[-1].isoformat(),
+        "day_from": m2s(lo),
+        "day_to": m2s(hi) if hi < 24 * 60 else "24:00",
+        "min_gap": HOURS_MIN_GAP,
+        "has_schedule": bool(who.used),
+        "schedules_used": [FACULTY_SHORT.get(r.faculty, r.faculty) for r in who.used],
+        "search_active": wu.is_active if wu else True,
+        "totals": tot,
+        "days": out_days,
     })
 
 
@@ -579,8 +731,10 @@ def setup_work_api(app: web.Application, bot: Bot) -> None:
     r.add_get("/api/work/me", api_me)
     r.add_patch("/api/work/me", api_me_update)
     r.add_get("/api/work/feed", api_feed)
+    r.add_get("/api/work/hours", api_hours)
     r.add_post("/api/work/busy", api_busy_add)
     r.add_delete("/api/work/busy", api_busy_delete)
+    r.add_post("/api/work/busy/delete", api_busy_delete)
     r.add_post("/api/work/shifts/{vid:\\d+}/apply", api_apply)
     r.add_post("/api/work/shifts/{vid:\\d+}/withdraw", api_withdraw)
 

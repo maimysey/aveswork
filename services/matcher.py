@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from config import WORK_MODE, WORK_RELAY_BOTS, is_tester
 from database import FACULTY_SESSIONS, work_session_maker
-from models import Employer, UserBusySlot, WorkPref, WorkUser
+from models import Employer, UserBusySlot, Vacancy, VacancyDelivery, WorkPref, WorkUser
 from services.availability import (  # noqa: F401 — реэкспорт для старого кода
     DEFAULT_TIMESLOTS,
     FACULTY_TIMESLOTS,
@@ -108,6 +108,7 @@ async def build_audience(
         }
         prefs = await load_prefs(session, everyone)
 
+        # Личные блокировки и уже взятые смены: «свободен по расписанию», но занят
         personally_busy: list[set[int]] = []
         for s in shifts:
             personally_busy.append(set((await session.execute(
@@ -116,7 +117,18 @@ async def build_audience(
                 .where(UserBusySlot.day_of_week == s["day_of_week"])
                 .where(UserBusySlot.start_time < shift_end)
                 .where(UserBusySlot.end_time > shift_start)
-            )).scalars().all()))
+            )).scalars().all())
+                # уже взял (откликнулся) другую смену, которая пересекается по времени
+                | set((await session.execute(
+                    select(VacancyDelivery.user_id)
+                    .join(Vacancy, Vacancy.id == VacancyDelivery.vacancy_id)
+                    .where(VacancyDelivery.user_id.in_(everyone))
+                    .where(VacancyDelivery.status == "applied")
+                    .where(Vacancy.status == "active")
+                    .where(Vacancy.target_date == s["target_date"])
+                    .where(Vacancy.start_time < shift_end)
+                    .where(Vacancy.end_time > shift_start)
+                )).scalars().all()))
 
     def off(uid: int) -> set[str]:
         p = prefs.get(uid)
